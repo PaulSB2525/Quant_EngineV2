@@ -1,0 +1,109 @@
+# =============================================================================
+# Dockerfile.bot — Quant Engine v2
+# Image: python:3.12-slim (Debian Bookworm base)
+# Target: Node A (Ryzen 3, 8 GB RAM, x86-64 Linux)
+#
+# Build stages:
+#   1. System packages: build-essential, gcc, libpq-dev, curl
+#      Necesario para compilar extensiones C de scipy (GARCH L-BFGS-B),
+#      numpy (BLAS/LAPACK wrappers) y asyncpg (PostgreSQL binary protocol).
+#      En Ryzen x86-64 la compilación tarda ~3-5 min en el primer build;
+#      las capas posteriores se cachean.
+#   2. pip install desde requirements.txt (cacheada si requirements no cambia)
+#   3. Copia de módulos de la aplicación
+#   4. Usuario no-root 'quant' (uid=1000) para least-privilege runtime
+# =============================================================================
+
+FROM python:3.12-slim
+
+# ---------------------------------------------------------------------------
+# Variables de entorno del intérprete
+#   PYTHONDONTWRITEBYTECODE=1  : no generar .pyc (inútil en container)
+#   PYTHONUNBUFFERED=1         : stdout/stderr sin buffer (logs en tiempo real)
+#   PIP_NO_CACHE_DIR=1         : no cache de pip dentro de la image (ahorra MB)
+#   PIP_DISABLE_PIP_VERSION_CHECK=1 : evitar el banner de "upgrade pip" en logs
+# ---------------------------------------------------------------------------
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+# ---------------------------------------------------------------------------
+# Dependencias de sistema
+#
+# build-essential  : gcc, g++, make — compilación de extensiones C (scipy, numpy)
+# gcc              : explícito para garantía, ya incluido en build-essential
+# curl             : healthcheck de QuestDB y Telegram (usado en scripts de ops)
+# libpq-dev        : headers de libpq requeridos por asyncpg al compilar
+#                    el adaptador de protocolo binario PostgreSQL
+#
+# Se limpia la caché de apt en la misma capa para no inflar la imagen.
+# ---------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        gcc \
+        curl \
+        libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Dependencias Python
+# Se copia sólo requirements.txt primero (antes del código fuente) para
+# aprovechar el cache de capas de Docker: si el código cambia pero los
+# requirements no, pip install no se re-ejecuta.
+# ---------------------------------------------------------------------------
+COPY requirements.txt .
+RUN pip install --upgrade pip && \
+    pip install -r requirements.txt
+
+# ---------------------------------------------------------------------------
+# Código fuente de la aplicación v2
+#
+# Módulos del motor matemático y riesgo:
+#   engine_math.py      : OU, Kalman (gap-aware), GARCH, Engle-Granger
+#   risk_manager.py     : CryptoRiskConfig, EquityRiskConfig, TCA v2
+#   llm_bridge.py       : Gemini + DeepSeek con schemas diferenciados
+#
+# Módulos de infraestructura v2 (nuevos en esta versión):
+#   broker_adapters.py  : BaseBrokerAdapter, BinanceBrokerAdapter,
+#                         AlpacaBrokerAdapter, factory
+#   market_session.py   : MarketSessionGuard, NYSE calendar 2024-2027,
+#                         DST via zoneinfo, early closes
+#
+# Módulo de orquestación:
+#   bot_core.py         : asyncio.TaskGroup, pair dispatcher, gap handler,
+#                         QuestDBWriter, TelegramNotifier
+# ---------------------------------------------------------------------------
+COPY engine_math.py \
+     risk_manager.py \
+     llm_bridge.py \
+     broker_adapters.py \
+     market_session.py \
+     bot_core.py \
+     ./
+
+# ---------------------------------------------------------------------------
+# Usuario no-root
+# uid=1000/gid=1000 es convención estándar para usuario de aplicación.
+# chown antes de USER para que las operaciones de escritura en /app
+# (logs, archivos temporales) funcionen sin sudo.
+# ---------------------------------------------------------------------------
+RUN useradd -m -u 1000 -s /bin/bash quant && \
+    chown -R quant:quant /app
+
+USER quant
+
+# ---------------------------------------------------------------------------
+# Healthcheck interno
+# Verifica que el proceso Python esté corriendo. El bot no expone HTTP,
+# así que usamos un check de proceso en lugar de curl a un endpoint.
+# Docker compose depende de los healthchecks de los servicios de datos
+# (QuestDB, Postgres, Redis) antes de arrancar el bot; este healthcheck
+# es una segunda línea de defensa post-arranque.
+# ---------------------------------------------------------------------------
+HEALTHCHECK --interval=60s --timeout=10s --start-period=120s --retries=3 \
+    CMD pgrep -f bot_core.py || exit 1
+
+CMD ["python", "-u", "bot_core.py"]

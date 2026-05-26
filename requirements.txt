@@ -1,0 +1,61 @@
+# =============================================================================
+# requirements.txt — Quant Engine v2 (Multi-Asset: Crypto + Equity)
+# Node A: Ryzen CPU, 8 GB RAM, Linux x86-64
+# Python 3.12+
+#
+# Grupos de dependencias:
+#   [MATH]    Núcleo cuantitativo: OU, Kalman, GARCH MLE, ADF
+#   [CRYPTO]  Binance CEX via ccxt.pro websockets
+#   [EQUITY]  Alpaca Markets via SDK oficial async
+#   [DB]      QuestDB ILP + PostgreSQL async + Redis
+#   [NET]     HTTP async para LLMs (Gemini, DeepSeek) y Telegram
+#   [CONFIG]  Gestión de variables de entorno
+# =============================================================================
+
+# --------------------------------------------------
+# [MATH] Núcleo cuantitativo
+#   numpy 1.26.4 : vectorización de OU, Kalman batch, rolling beta
+#   scipy 1.13.1 : L-BFGS-B para GARCH MLE, linalg para ADF
+#   NOTA: scipy requiere compilación de extensiones C en Ryzen local.
+#   El Dockerfile.bot instala build-essential + gcc + libpq-dev antes
+#   de ejecutar este requirements para garantizar la compilación.
+# --------------------------------------------------
+numpy==1.26.4
+scipy==1.13.1
+
+# --------------------------------------------------
+# [CRYPTO] Binance leg — ccxt.pro websockets
+#   ccxt >= 4.3.50 : ccxt.pro ya está incluido en el paquete principal
+#   a partir de la versión 4. No instalar ccxtpro por separado.
+# --------------------------------------------------
+ccxt>=4.3.50
+
+# --------------------------------------------------
+# [EQUITY] Alpaca leg — SDK oficial
+#   alpaca-py >= 0.30.0 : async data stream (StockDataStream),
+#   TradingClient, bracket orders nativos.
+#   Requiere Python 3.12+ (usa typing.TypeAlias y match/case internamente).
+# --------------------------------------------------
+alpaca-py>=0.30.0
+
+# --------------------------------------------------
+# [DB] Persistencia multi-capa
+#   asyncpg : PostgreSQL async para trades, equity_snapshots
+#   redis   : Redis async para day-lock, Kelly smoothing, correlation ZSETs
+# --------------------------------------------------
+asyncpg==0.29.0
+redis==5.0.7
+
+# --------------------------------------------------
+# [NET] HTTP async
+#   httpx : LLM bridges (Gemini REST, DeepSeek REST) y Telegram notifier
+#   Versión 0.27.x es la última compatible con el cliente sync/async
+#   que usa alpaca-py internamente; no subir a 0.28+ sin validar compat.
+# --------------------------------------------------
+httpx==0.27.0
+
+# --------------------------------------------------
+# [CONFIG] Variables de entorno
+#   python-dotenv : carga .env en desarrollo local y Docker sin env_file
+# --------------------------------------------------
+python-dotenv==1.0.1

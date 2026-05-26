@@ -1,0 +1,260 @@
+# =============================================================================
+# docker-compose.yml — Quant Engine v2 (Multi-Asset)
+# Node A: Ryzen 3, 8 GB RAM, SSD, Linux x86-64
+#
+# Servicios:
+#   questdb   (1500M) : Series temporales vía ILP TCP, SQL console
+#   postgres   (512M) : Trades, equity_snapshots, pair_partner refs (OLTP)
+#   redis      (256M) : Day-lock SETNX, Kelly EMA, correlation ZSETs
+#   bot       (1000M) : Motor multi-asset: OU/GARCH/Kalman + Brokers + Risk
+#   dashboard  (512M) : Streamlit v2 con Tab de Pair Trades y Session Guard
+#
+# Distribución de RAM (8 GB Node A):
+#   QuestDB    1.5 GB ─── column cache + WAL
+#   Postgres   0.5 GB ─── shared_buffers + work_mem
+#   Redis      0.25 GB ── in-memory + AOF
+#   Bot        1.0 GB ─── asyncio loops + numpy buffers GARCH/OU/pair
+#   Dashboard  0.5 GB ─── Streamlit session + plotly rendering
+#   OS + misc  ~4.25 GB ─ kernel, Docker daemon, headroom
+#
+# Para el Node B (Raspberry Pi 4, 4 GB):
+#   Usar SÓLO el servicio 'dashboard', apuntando las DSNs al Node A via LAN.
+#   Ver docker-compose.dashboard.yml (ver instrucciones.md sección Pi).
+# =============================================================================
+
+version: "3.9"
+
+services:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # DATA TIER
+  # ──────────────────────────────────────────────────────────────────────────
+
+  questdb:
+    image: questdb/questdb:7.4.0
+    container_name: quant_questdb
+    restart: unless-stopped
+    ports:
+      - "9000:9000"   # HTTP SQL console (acceder desde LAN: http://NODE_A_IP:9000)
+      - "9009:9009"   # ILP TCP — bot escribe ticks aquí; latencia < 1ms
+      - "8812:8812"   # PostgreSQL wire — dashboard puede leer via psycopg2
+    volumes:
+      - questdb_data:/var/lib/questdb
+    environment:
+      # 2 workers es suficiente para un Ryzen 3; más workers no escala linealmente
+      QDB_SHARED_WORKER_COUNT: "2"
+      QDB_HTTP_ENABLED: "true"
+      QDB_PG_ENABLED: "true"
+      QDB_TELEMETRY_ENABLED: "false"
+      # Limitar WAL en-disk para evitar saturar SSD durante alto throughput
+      QDB_WAL_MAX_LAG_TXN_COUNT: "200"
+    deploy:
+      resources:
+        limits:
+          memory: 1500M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: quant_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-quant}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quant}
+      POSTGRES_DB: ${POSTGRES_DB:-quant}
+      # Tuning para 512M: shared_buffers = 25% del límite del container
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    command: >
+      postgres
+        -c shared_buffers=128MB
+        -c work_mem=4MB
+        -c maintenance_work_mem=32MB
+        -c effective_cache_size=384MB
+        -c max_connections=20
+        -c wal_compression=on
+        -c checkpoint_completion_target=0.9
+        -c log_min_duration_statement=1000
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-quant} -d ${POSTGRES_DB:-quant}"]
+      interval: 20s
+      timeout: 5s
+      start_period: 15s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: quant_redis
+    restart: unless-stopped
+    # maxmemory 200mb < limite de container 256M: deja headroom para overhead de Redis
+    # allkeys-lru: evicta claves menos usadas si se llena (correlation ZSETs antiguos)
+    # appendonly yes: AOF para recuperar day-lock y Kelly state tras reinicio
+    command: >
+      redis-server
+        --maxmemory 200mb
+        --maxmemory-policy allkeys-lru
+        --appendonly yes
+        --appendfsync everysec
+        --save 900 1
+        --save 300 10
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 15s
+      timeout: 3s
+      start_period: 5s
+      retries: 5
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # ENGINE — Bot Multi-Asset v2
+  # ──────────────────────────────────────────────────────────────────────────
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    container_name: quant_bot
+    restart: unless-stopped
+    depends_on:
+      questdb:  { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+
+    # env_file carga .env completo (incluye secretos como API keys).
+    # Las variables en 'environment' a continuación SOBREESCRIBEN las del
+    # env_file si hay conflicto, permitiendo que los DSNs internos del
+    # compose apunten a los nombres de los servicios (questdb, postgres, redis)
+    # en lugar de IPs externas.
+    env_file: .env
+
+    environment:
+      # ── Infra: DSNs internos del compose network ──────────────────────────
+      QUESTDB_HOST: questdb
+      QUESTDB_ILP_PORT: "9009"
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-quant}:${POSTGRES_PASSWORD:-quant}@postgres:5432/${POSTGRES_DB:-quant}
+      REDIS_URL: redis://redis:6379/0
+      PYTHONUNBUFFERED: "1"
+
+      # ── Brokers v2 ────────────────────────────────────────────────────────
+      # BINANCE — Crypto leg (ccxt.pro websockets)
+      BINANCE_API_KEY: ${BINANCE_API_KEY:-}
+      BINANCE_API_SECRET: ${BINANCE_API_SECRET:-}
+
+      # ALPACA — Equity leg (alpaca-py SDK oficial)
+      ALPACA_API_KEY: ${ALPACA_API_KEY:-}
+      ALPACA_API_SECRET: ${ALPACA_API_SECRET:-}
+
+      # ── Activos y pares ───────────────────────────────────────────────────
+      # SYMBOLS: coma-separados con prefijo de asset class
+      #   Ej: CRYPTO:BTC/USDT,CRYPTO:ETH/USDT,EQUITY:AAPL,EQUITY:NVDA
+      SYMBOLS: ${SYMBOLS:-CRYPTO:BTC/USDT,CRYPTO:ETH/USDT}
+
+      # PAIR_SYMBOLS: coma-separados de pares "ASSET_A|ASSET_B"
+      #   Ej: CRYPTO:ETH/USDT|CRYPTO:BTC/USDT,EQUITY:NVDA|EQUITY:SMH
+      PAIR_SYMBOLS: ${PAIR_SYMBOLS:-}
+
+      # ── Control de sesión de mercado ──────────────────────────────────────
+      # Pre/post market equity: alta slippage, NO recomendado para HF
+      ALLOW_PRE_MARKET: ${ALLOW_PRE_MARKET:-false}
+      ALLOW_POST_MARKET: ${ALLOW_POST_MARKET:-false}
+
+      # ── Paper trading (CRÍTICO: mantener true hasta track record) ─────────
+      PAPER_TRADING: ${PAPER_TRADING:-true}
+
+      # ── LLMs ─────────────────────────────────────────────────────────────
+      ENABLE_LLM_VALIDATION: ${ENABLE_LLM_VALIDATION:-true}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+
+      # ── Alertas ───────────────────────────────────────────────────────────
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+
+    deploy:
+      resources:
+        limits:
+          # 1 GB para: asyncio event loop + numpy buffers (OU/GARCH sliding
+          # windows 1500 returns × 8 bytes × N symbols) + GARCH refit scipy
+          # stack frame (scipy L-BFGS-B ~50 MB peak) + asyncpg connections
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"   # rotar al llegar a 10 MB
+        max-file: "5"     # mantener 5 archivos = 50 MB máximo en disco
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # ADMIN PANEL — Streamlit v2
+  # Puede correr en Node A (aquí) o en Node B (Pi) con compose separado.
+  # Si lo mueves al Pi, las variables DSN deben apuntar a NODE_A_IP.
+  # ──────────────────────────────────────────────────────────────────────────
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    container_name: quant_dashboard
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+
+    env_file: .env
+
+    environment:
+      # ── DSNs internos ─────────────────────────────────────────────────────
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-quant}:${POSTGRES_PASSWORD:-quant}@postgres:5432/${POSTGRES_DB:-quant}
+      REDIS_URL: redis://redis:6379/0
+
+      # ── Variables necesarias para el MarketSessionGuard display ──────────
+      # El dashboard muestra el estado de sesión de cada equity configurado.
+      # Lee SYMBOLS para saber qué activos monitorear en el System Health tab.
+      SYMBOLS: ${SYMBOLS:-CRYPTO:BTC/USDT,CRYPTO:ETH/USDT}
+      PAIR_SYMBOLS: ${PAIR_SYMBOLS:-}
+      ALLOW_PRE_MARKET: ${ALLOW_PRE_MARKET:-false}
+      ALLOW_POST_MARKET: ${ALLOW_POST_MARKET:-false}
+
+      # ── Auth del panel ────────────────────────────────────────────────────
+      # AUTH_CONFIG_PATH: ruta dentro del container al YAML de credenciales.
+      # Si no se monta un volumen con el YAML, usa ADMIN_PASSWORD_HASH del env.
+      AUTH_CONFIG_PATH: ${AUTH_CONFIG_PATH:-/etc/quant/auth.yaml}
+      ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:-}
+      AUTH_COOKIE_KEY: ${AUTH_COOKIE_KEY:-change-me-32-chars-min-pls}
+
+    ports:
+      - "8501:8501"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+# ──────────────────────────────────────────────────────────────────────────
+# Volúmenes persistentes
+# ──────────────────────────────────────────────────────────────────────────
+
+volumes:
+  questdb_data:
+    driver: local
+  pg_data:
+    driver: local
+  redis_data:
+    driver: local
