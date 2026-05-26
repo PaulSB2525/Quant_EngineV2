@@ -671,8 +671,11 @@ class RiskManager:
         size_quote = kelly_final * current_equity
 
         # ---- 8. SL/TP por ATR (con multiplicadores por asset class) ----
-        sl_dist = atr * class_cfg.per_trade_stop_loss_atr_mult
-        tp_dist = atr * class_cfg.per_trade_take_profit_atr_mult
+        # Coherencia dimensional: ATR ya viene en unidades de precio del
+        # subyacente. Forzamos no-negatividad por si el estimador de ATR
+        # entrega valores degenerados durante gaps o cold-start.
+        sl_dist = max(float(atr), 0.0) * class_cfg.per_trade_stop_loss_atr_mult
+        tp_dist = max(float(atr), 0.0) * class_cfg.per_trade_take_profit_atr_mult
         if side == "long":
             sl = current_price - sl_dist
             tp = current_price + tp_dist
@@ -681,6 +684,31 @@ class RiskManager:
             tp = current_price - tp_dist
         else:
             raise ValueError(f"side debe ser 'long' o 'short', recibido {side!r}")
+
+        # Sanitización defensiva antes de devolver al broker adapter:
+        #   1. Floor positivo: equities y crypto cotizan > 0; un TP negativo
+        #      en un short con ATR enorme reventaría la validación de Alpaca.
+        #   2. Redondeo a 2 decimales (tick size estándar equity > $1).
+        #   3. Invariante de orientación: long ⇒ TP > entry > SL; short ⇒
+        #      SL > entry > TP. Si la sanitización rompió la invariante,
+        #      revertir al snap mínimo (1 tick de separación).
+        MIN_PRICE = 0.01
+        MIN_GAP = 0.01
+        sl = round(max(sl, MIN_PRICE), 2)
+        tp = round(max(tp, MIN_PRICE), 2)
+
+        if side == "long" and tp <= sl:
+            tp = round(sl + MIN_GAP, 2)
+        elif side == "short" and tp >= sl:
+            # En short, TP debe ser estrictamente menor que SL. Si la
+            # sanitización los aplastó al floor, separar artificialmente
+            # SL hacia arriba para preservar la geometría.
+            sl = round(max(sl, tp + MIN_GAP), 2)
+            # Y si el floor también empujó tp hacia arriba del precio,
+            # asegurar tp < current_price para que no sea inejecutable.
+            if tp >= current_price:
+                tp = round(max(current_price - MIN_GAP, MIN_PRICE), 2)
+                sl = round(max(sl, tp + MIN_GAP), 2)
 
         return RiskDecision(
             verdict=RiskVerdict.APPROVED,

@@ -464,6 +464,7 @@ class TradingBot:
                 api_secret=self.cfg.alpaca_api_secret,
                 paper_trading=self.cfg.paper_trading,
                 quote_currency=self.cfg.equity_quote,
+                redis_client=self.redis,
             )
             await a.connect()
             self.brokers[AssetClass.EQUITY] = a
@@ -982,9 +983,34 @@ class TradingBot:
             return 0.0
         try:
             bal = await broker.fetch_balance()
-            return bal.total_quote
+            eq = bal.total_quote
+            # El adaptador devuelve NaN como "indeterminado" cuando hay un
+            # fallo transitorio de red y NO hay cache previa. NUNCA propagar
+            # NaN al RiskManager: usar el último _last_known_equity en lugar
+            # de 0.0 (que dispararía un falso DD del 100%).
+            if eq != eq or eq is None:  # NaN-check sin importar math
+                last = getattr(self, "_last_known_equity", {}).get(asset_class)
+                if last is not None and last > 0:
+                    logger.warning(
+                        "[%s] equity indeterminada; usando último known=%.2f",
+                        asset_class, last)
+                    return last
+                logger.error(
+                    "[%s] equity indeterminada y sin known previo; "
+                    "devolviendo 0 (downstream debe abstenerse de operar).",
+                    asset_class)
+                return 0.0
+            # Cachear último valor conocido por asset class.
+            if not hasattr(self, "_last_known_equity"):
+                self._last_known_equity = {}
+            if eq > 0:
+                self._last_known_equity[asset_class] = eq
+            return eq
         except Exception as e:
             logger.warning("fetch_balance %s falló: %s", asset_class, e)
+            last = getattr(self, "_last_known_equity", {}).get(asset_class)
+            if last is not None and last > 0:
+                return last
             return 0.0
 
     async def _equity_snapshot_loop(self):
