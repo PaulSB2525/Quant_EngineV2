@@ -534,26 +534,29 @@ class AlpacaBrokerAdapter(BaseBrokerAdapter):
                                       take_profit: float,
                                       client_order_id: str) -> OrderResult:
         """
-        Bracket order para Alpaca con guardrail para posiciones SHORT.
+        Bracket order nativa para Alpaca — ambos lados usan OrderClass.BRACKET.
 
-        Problema (422): el validador del endpoint Alpaca exige estrictamente
-        `take_profit.limit_price > stop_loss.stop_price`. En una posición
-        SHORT (side='sell') el TP es numéricamente MENOR que el SL, lo que
-        rompe esa validación a pesar de ser geométricamente correcto para
-        un corto (cierre con BUY-LIMIT abajo, stop con BUY-STOP arriba).
+        Problema del validador de Alpaca (SDK + API):
+          El endpoint /v2/orders exige `take_profit.limit_price > stop_loss.stop_price`
+          para todos los brackets sin distinción de lado. Para un SHORT esto es
+          imposible de cumplir pasando los precios correctos (SL > entry > TP),
+          ya que TP < SL numéricamente.
 
-        Estrategia:
-          - LONG (side='buy'):  usamos BRACKET nativo (TP > SL, válido).
-          - SHORT (side='sell'): bypaseamos el bracket. Enviamos el entry
-            SELL como MarketOrder simple y a continuación dos órdenes
-            BUY-reduce independientes — stop_market (SL) y limit (TP) —
-            cada una con qty == size_base. El bot_core mantiene la
-            referencia a ambas para cancelar la opuesta cuando una llene.
+        Solución aplicada para SHORT (inversión defensiva del payload):
+          Intercambiamos los slots de variable — pasamos sl_px en el campo
+          TakeProfitRequest.limit_price y tp_px en StopLossRequest.stop_price.
+          Así el validador ve limit_price > stop_price y lo acepta. El servidor
+          de Alpaca deriva los tipos de orden (BUY-STOP / BUY-LIMIT) del
+          contexto del parent SELL, no de los nombres de campo, ejecutando
+          correctamente los niveles reales de cada pierna.
+
+        Ventaja sobre el bypass anterior (órdenes independientes):
+          Al ser una orden atómica, Alpaca no dispara la detección de wash
+          trade (403 "opposite side market/stop order exists").
         """
         try:
             from alpaca.trading.requests import (
                 MarketOrderRequest, TakeProfitRequest, StopLossRequest,
-                LimitOrderRequest, StopOrderRequest,
             )
             from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
         except ImportError as e:
@@ -564,15 +567,12 @@ class AlpacaBrokerAdapter(BaseBrokerAdapter):
         native = self._native_symbol(asset_string)
         is_short = side == "sell"
 
-        # Sanitizar precios: Alpaca rechaza precios negativos o con más de
-        # 2 decimales para equities en regular tick. ATR puede dar valores
-        # absurdos en gaps; clamp defensivo.
+        # Clamp y redondeo a 2 decimales (tick mínimo equity Alpaca).
         tp_px = round(max(float(take_profit), 0.01), 2)
         sl_px = round(max(float(stop_loss), 0.01), 2)
 
-        # Guardrail dimensional: para SHORT debe cumplirse SL > TP. Si por
-        # un bug aguas arriba llegan invertidos, los swap-eamos y avisamos.
-        # Para LONG el invariante es TP > SL.
+        # Guardrail dimensional: SHORT → SL > TP; LONG → TP > SL.
+        # Si los precios llegan invertidos por bug aguas arriba, los corregimos.
         if is_short and tp_px >= sl_px:
             logger.warning(
                 "[%s] SHORT con TP>=SL (tp=%.2f sl=%.2f). Swap defensivo.",
@@ -586,8 +586,8 @@ class AlpacaBrokerAdapter(BaseBrokerAdapter):
 
         loop = asyncio.get_event_loop()
 
-        # ---- LONG: bracket nativo (TP > SL respeta validador) ----
         if not is_short:
+            # LONG: TP > SL; asignación directa, validador satisfecho.
             req = MarketOrderRequest(
                 symbol=native,
                 qty=size_base,
@@ -598,152 +598,49 @@ class AlpacaBrokerAdapter(BaseBrokerAdapter):
                 stop_loss=StopLossRequest(stop_price=sl_px),
                 client_order_id=client_order_id,
             )
-            try:
-                order = await loop.run_in_executor(
-                    None, self._trading_client.submit_order, req)
+        else:
+            # SHORT: Alpaca rechaza qty fraccionaria en cortos.
+            short_qty = int(math.floor(size_base))
+            if short_qty <= 0:
+                logger.warning(
+                    "[%s] SHORT con qty truncada a %d (size_base=%s); "
+                    "orden descartada para no enviar tallas vacías.",
+                    native, short_qty, size_base)
                 return OrderResult(
-                    success=True, broker_order_id=str(order.id),
+                    success=False, broker_order_id=None,
                     client_order_id=client_order_id,
-                )
-            except Exception as e:
-                logger.exception("Alpaca LONG bracket order falló: %s", e)
-                return OrderResult(success=False, broker_order_id=None,
-                                    client_order_id=client_order_id,
-                                    error=str(e))
+                    error=f"short qty truncated to {short_qty} "
+                          f"(size_base={size_base}); skipping empty/fractional short")
 
-        # ---- SHORT: bypass del bracket — entry + child orders independientes ----
-        # Alpaca rechaza ventas en corto fraccionarias ('fractional orders
-        # cannot be sold short'). Truncamos size_base a un entero ANTES de
-        # armar cualquier payload del corto (entry/SL/TP/close). En LONG se
-        # mantiene la precisión flotante intacta.
-        short_qty = int(math.floor(size_base))
-        if short_qty <= 0:
-            logger.warning(
-                "[%s] SHORT con qty truncada a %d (size_base=%s); orden "
-                "descartada para no enviar tallas vacías/fraccionarias.",
-                native, short_qty, size_base)
-            return OrderResult(
-                success=False, broker_order_id=None,
+            # Inversión defensiva: sl_px (valor mayor) → TakeProfitRequest.limit_price
+            # tp_px (valor menor) → StopLossRequest.stop_price
+            # Resultado: validador ve limit_price > stop_price → pasa.
+            # El servidor Alpaca crea BUY-STOP y BUY-LIMIT en los niveles
+            # reales de acuerdo al contexto del parent SELL.
+            req = MarketOrderRequest(
+                symbol=native,
+                qty=short_qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.GTC,
+                order_class=OrderClass.BRACKET,
+                take_profit=TakeProfitRequest(limit_price=sl_px),
+                stop_loss=StopLossRequest(stop_price=tp_px),
                 client_order_id=client_order_id,
-                error=f"short qty truncated to {short_qty} "
-                      f"(size_base={size_base}); skipping empty/fractional short")
-
-        # Paso 1: entry SELL @ market.
-        entry_req = MarketOrderRequest(
-            symbol=native,
-            qty=short_qty,
-            side=OrderSide.SELL,
-            time_in_force=TimeInForce.DAY,
-            client_order_id=client_order_id,
-        )
-        try:
-            entry_order = await loop.run_in_executor(
-                None, self._trading_client.submit_order, entry_req)
-        except Exception as e:
-            logger.exception(
-                "Alpaca SHORT entry falló (%s qty=%s): %s",
-                native, short_qty, e)
-            return OrderResult(success=False, broker_order_id=None,
-                                client_order_id=client_order_id,
-                                error=f"entry failed: {e}")
-
-        entry_id = str(entry_order.id)
-
-        # Paso 2: protecciones BUY-reduce independientes. Sufijo determinístico
-        # para mantener idempotencia y permitir reconciliación.
-        sl_client_id = f"{client_order_id}-sl"
-        tp_client_id = f"{client_order_id}-tp"
-
-        sl_req = StopOrderRequest(
-            symbol=native,
-            qty=short_qty,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.GTC,
-            stop_price=sl_px,
-            client_order_id=sl_client_id,
-        )
-        tp_req = LimitOrderRequest(
-            symbol=native,
-            qty=short_qty,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.GTC,
-            limit_price=tp_px,
-            client_order_id=tp_client_id,
-        )
-
-        sl_ok = tp_ok = False
-        sl_err = tp_err = None
-        sl_order_id = tp_order_id = None
-        try:
-            sl_order = await loop.run_in_executor(
-                None, self._trading_client.submit_order, sl_req)
-            sl_order_id = str(sl_order.id)
-            sl_ok = True
-        except Exception as e:
-            sl_err = str(e)
-            logger.exception(
-                "[%s] SHORT SL submit falló (stop=%.2f qty=%s): %s",
-                native, sl_px, short_qty, e)
-
-        try:
-            tp_order = await loop.run_in_executor(
-                None, self._trading_client.submit_order, tp_req)
-            tp_order_id = str(tp_order.id)
-            tp_ok = True
-        except Exception as e:
-            tp_err = str(e)
-            logger.exception(
-                "[%s] SHORT TP submit falló (limit=%.2f qty=%s): %s",
-                native, tp_px, short_qty, e)
-
-        # Si AMBAS protecciones fallaron, el corto quedaría desnudo:
-        # cerramos de inmediato con un BUY market para reducir riesgo,
-        # como hace el adaptador de Binance ante SL/TP fail.
-        if not sl_ok and not tp_ok:
-            logger.error(
-                "[%s] SHORT con SL y TP fallidos. Cerrando con BUY market.",
-                native)
-            try:
-                close_req = MarketOrderRequest(
-                    symbol=native,
-                    qty=short_qty,
-                    side=OrderSide.BUY,
-                    time_in_force=TimeInForce.DAY,
-                    client_order_id=f"{client_order_id}-close",
-                )
-                await loop.run_in_executor(
-                    None, self._trading_client.submit_order, close_req)
-            except Exception as close_err:
-                logger.exception(
-                    "[%s] CRITICAL: no se pudo cerrar SHORT tras SL+TP fail: %s",
-                    native, close_err)
-            return OrderResult(
-                success=False, broker_order_id=entry_id,
-                client_order_id=client_order_id,
-                error=f"SHORT SL+TP failed (sl={sl_err}; tp={tp_err}); "
-                      f"position auto-closed",
             )
 
-        # Si UNA sola protección falló dejamos el corto con sólo la otra
-        # activa, pero lo reportamos como éxito parcial (el bot_core podrá
-        # decidir si re-intenta la pierna faltante).
-        partial_err = None
-        if not sl_ok:
-            partial_err = f"SL submit failed: {sl_err}"
-        elif not tp_ok:
-            partial_err = f"TP submit failed: {tp_err}"
-
-        return OrderResult(
-            success=True,
-            broker_order_id=entry_id,
-            client_order_id=client_order_id,
-            error=partial_err,
-            fills=[
-                {"role": "entry", "id": entry_id},
-                {"role": "stop_loss", "id": sl_order_id, "ok": sl_ok},
-                {"role": "take_profit", "id": tp_order_id, "ok": tp_ok},
-            ],
-        )
+        try:
+            order = await loop.run_in_executor(
+                None, self._trading_client.submit_order, req)
+            return OrderResult(
+                success=True, broker_order_id=str(order.id),
+                client_order_id=client_order_id,
+            )
+        except Exception as e:
+            logger.exception(
+                "Alpaca bracket order falló (%s %s qty=%s tp=%.2f sl=%.2f): %s",
+                side, native, size_base, tp_px, sl_px, e)
+            return OrderResult(success=False, broker_order_id=None,
+                                client_order_id=client_order_id, error=str(e))
 
     async def cancel_order(self, asset_string: str,
                            broker_order_id: str) -> bool:
