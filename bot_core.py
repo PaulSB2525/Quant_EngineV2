@@ -1382,32 +1382,78 @@ class TradingBot:
         broker_b = self.brokers[state_b.asset_class]
         cid_a = broker_a.make_client_order_id(pair.sym_a, side_a_broker)
         cid_b = broker_b.make_client_order_id(pair.sym_b, side_b_broker)
+        side_a = "long" if side_a_broker == "buy" else "short"
+        side_b = "long" if side_b_broker == "buy" else "short"
 
-        # Legs sin bracket porque el SL/TP es sobre el spread, no sobre cada leg
+        # ---- OUTBOX (C-4): ambos legs 'pending' ANTES de enviar nada ----
+        try:
+            async with self.pg_pool.acquire() as conn:
+                for sym, ac, side, cid, entry, size_q, size_b, partner in [
+                    (pair.sym_a, state_a.asset_class.value, side_a,
+                     cid_a, state_a.kalman.x, decision.leg_a_size_quote,
+                     size_a_base, pair.sym_b),
+                    (pair.sym_b, state_b.asset_class.value, side_b,
+                     cid_b, state_b.kalman.x, decision.leg_b_size_quote,
+                     size_b_base, pair.sym_a),
+                ]:
+                    await conn.execute("""
+                        INSERT INTO trades
+                        (client_order_id, symbol, asset_class, side, pair_partner,
+                         entry_price, size_quote, size_base, status,
+                         reasoning, risk_metrics)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$10)
+                        ON CONFLICT (client_order_id) DO NOTHING
+                    """, cid, sym, ac, side, partner, entry, size_q, size_b,
+                        json.dumps({"reason": decision.reason}),
+                        json.dumps(decision.metrics))
+        except Exception as e:
+            logger.exception("[PAIR %s/%s] No se pudo registrar 'pending'; "
+                             "no se envían órdenes.", pair.sym_a, pair.sym_b)
+            await self.tg.send(
+                f"🚨 DB no disponible: pair {pair.sym_a}/{pair.sym_b} ABORTADO "
+                f"antes de enviar.\n{e}", parse_mode=None)
+            return
+
+        # Legs sin bracket: el SL/TP es sobre el spread, no sobre cada leg.
         result_a = await broker_a.submit_market_order(
             pair.sym_a, side_a_broker, size_a_base, cid_a)
         if not result_a.success:
+            # Nada ejecutado: cancelar ambas filas pending (no quedan posiciones).
             await self.tg.send(f"🚨 Pair leg A falló:\n{result_a.error}",
                                parse_mode=None)
+            await self._mark_status(cid_a, "canceled",
+                                    notes=("leg A submit failed: "
+                                           + (result_a.error or ""))[:500])
+            await self._mark_status(cid_b, "canceled",
+                                    notes="sibling leg A failed before submit")
             return
 
         result_b = await broker_b.submit_market_order(
             pair.sym_b, side_b_broker, size_b_base, cid_b)
         if not result_b.success:
-            # Rollback leg A
-            await self.tg.send(f"🚨 Pair leg B falló, rollback A:\n{result_b.error}",
-                               parse_mode=None)
-            opp = "sell" if side_a_broker == "buy" else "buy"
-            await broker_a.submit_market_order(pair.sym_a, opp, size_a_base,
-                                                  broker_a.make_client_order_id(pair.sym_a, opp))
+            # Leg A ejecutado, leg B no. Rollback de A CON VERIFICACIÓN (C-5).
+            await self.tg.send(
+                f"🚨 Pair leg B falló, rollback de leg A en curso:\n{result_b.error}",
+                parse_mode=None)
+            await self._mark_status(cid_b, "canceled",
+                                    notes=("leg B submit failed: "
+                                           + (result_b.error or ""))[:500])
+            entry_a_px = result_a.avg_price or state_a.kalman.x
+            await self._rollback_pair_leg_a(
+                pair, broker_a, cid_a, side_a, size_a_base, entry_a_px)
             return
 
+        # ---- Ambos legs OK → confirmar 'pending' -> 'open' ----
+        entry_a_px = result_a.avg_price or state_a.kalman.x
+        entry_b_px = result_b.avg_price or state_b.kalman.x
         pair.open_position = {
             "client_id_a": cid_a, "client_id_b": cid_b,
             "broker_id_a": result_a.broker_order_id,
             "broker_id_b": result_b.broker_order_id,
             "side": "long_spread" if is_long_spread else "short_spread",
-            "entry_a": state_a.kalman.x, "entry_b": state_b.kalman.x,
+            "side_a": side_a, "side_b": side_b,
+            "entry_a": entry_a_px, "entry_b": entry_b_px,
+            "size_a_base": size_a_base, "size_b_base": size_b_base,
             "size_a_quote": decision.leg_a_size_quote,
             "size_b_quote": decision.leg_b_size_quote,
             "entry_spread": math.log(state_a.kalman.x) - pair.coint_params.beta
@@ -1416,37 +1462,96 @@ class TradingBot:
             "tp_spread_distance": decision.take_profit_price,
             "opened_at": time.time(),
         }
+        ok_a = await self._confirm_entry_open(cid_a, entry_a_px)
+        ok_b = await self._confirm_entry_open(cid_b, entry_b_px)
+        if ok_a and ok_b:
+            await self.tg.send(
+                f"📊 *PAIR ENTRY* `{pair.sym_a}/{pair.sym_b}`\n"
+                f"Side: `{decision.metrics.get('pair_side')}`\n"
+                f"Leg A: `${decision.leg_a_size_quote:,.2f}` @ {entry_a_px:.4f}\n"
+                f"Leg B: `${decision.leg_b_size_quote:,.2f}` @ {entry_b_px:.4f}\n"
+                + self.tg.code_block(decision.reason[:200])
+            )
+        else:
+            pair.open_position["_db_unconfirmed"] = True
+            logger.critical(
+                "[PAIR %s/%s] legs ejecutados pero confirmación DB incompleta "
+                "(a=%s b=%s); reintento en background.",
+                pair.sym_a, pair.sym_b, ok_a, ok_b)
+            await self.tg.send(
+                f"🚨 CRÍTICO pair {pair.sym_a}/{pair.sym_b}: legs ejecutados pero "
+                f"DB no confirmó 'open'. Reintentando; par bloqueado.",
+                parse_mode=None)
+            self._spawn_bg(self._retry_confirm_pair_open(
+                cid_a, cid_b, entry_a_px, entry_b_px, pair))
 
-        # Persistencia: dos rows con pair_partner mutuamente apuntando
-        async with self.pg_pool.acquire() as conn:
-            for sym, ac, side, cid, entry, size_q, size_b, partner in [
-                (pair.sym_a, state_a.asset_class.value, side_a_broker,
-                 cid_a, state_a.kalman.x, decision.leg_a_size_quote,
-                 size_a_base, pair.sym_b),
-                (pair.sym_b, state_b.asset_class.value, side_b_broker,
-                 cid_b, state_b.kalman.x, decision.leg_b_size_quote,
-                 size_b_base, pair.sym_a),
-            ]:
-                await conn.execute("""
-                    INSERT INTO trades
-                    (client_order_id, symbol, asset_class, side, pair_partner,
-                     entry_price, size_quote, size_base, status,
-                     reasoning, risk_metrics)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'open',$9,$10)
-                    ON CONFLICT (client_order_id) DO NOTHING
-                """, cid, sym, ac, side, partner, entry, size_q, size_b,
-                    json.dumps({"reason": decision.reason}),
-                    json.dumps(decision.metrics))
+    async def _rollback_pair_leg_a(self, pair: "PairState", broker_a,
+                                    cid_a: str, side_a: str,
+                                    size_a_base: float,
+                                    entry_a_px: Optional[float]) -> None:
+        """
+        C-5: el leg B falló; revierte el leg A con reintentos verificados
+        (5 intentos, backoff exponencial). Si todos fallan → leg A queda
+        'pair_leg_a_orphaned', el par se bloquea indefinidamente y se alerta.
+        """
+        opp = "sell" if side_a == "long" else "buy"
+        backoff = 2.0
+        for attempt in range(5):
+            res = await broker_a.submit_market_order(
+                pair.sym_a, opp, size_a_base,
+                broker_a.make_client_order_id(pair.sym_a, opp))
+            if res.success:
+                exit_px = res.avg_price
+                pnl_quote = None
+                if exit_px is not None and entry_a_px is not None:
+                    direction = 1.0 if side_a == "long" else -1.0
+                    pnl_quote = direction * (exit_px - entry_a_px) * size_a_base
+                await self._finalize_trade_closed(
+                    cid_a, entry_a_px, exit_px, pnl_quote,
+                    exit_reason="rollback",
+                    notes="leg A rolled back after leg B failure")
+                await self.tg.send(
+                    f"✅ Rollback leg A OK {pair.sym_a} coid={cid_a} exit={exit_px}",
+                    parse_mode=None)
+                return
+            logger.error("[PAIR %s] rollback leg A intento %d/5 falló: %s",
+                         pair.sym_a, attempt + 1, res.error)
+            await asyncio.sleep(backoff)
+            backoff *= 2
 
-        # Ambos símbolos del par en un inline code span por el mismo motivo que
-        # en la entrada simple: contenido literal, inmune a '_'/'*'/'.' sin escape.
+        # Rollback imposible: leg A queda direccional naked. Bloquear el par.
+        await self._mark_status(
+            cid_a, "pair_leg_a_orphaned",
+            notes="rollback failed; naked leg A; manual intervention required")
+        pair.open_position = {"status": "pair_leg_a_orphaned",
+                              "client_id_a": cid_a, "side_a": side_a,
+                              "size_a_base": size_a_base,
+                              "opened_at": time.time()}
         await self.tg.send(
-            f"📊 *PAIR ENTRY* `{pair.sym_a}/{pair.sym_b}`\n"
-            f"Side: `{decision.metrics.get('pair_side')}`\n"
-            f"Leg A: `${decision.leg_a_size_quote:,.2f}` @ {state_a.kalman.x:.4f}\n"
-            f"Leg B: `${decision.leg_b_size_quote:,.2f}` @ {state_b.kalman.x:.4f}\n"
-            + self.tg.code_block(decision.reason[:200])
-        )
+            f"🆘 PAIR LEG A ORPHANED {pair.sym_a} {side_a} size={size_a_base} "
+            f"coid={cid_a}: rollback imposible, posición naked. Par bloqueado, "
+            f"requiere intervención manual.", parse_mode=None)
+
+    async def _retry_confirm_pair_open(self, cid_a: str, cid_b: str,
+                                        entry_a_px: Optional[float],
+                                        entry_b_px: Optional[float],
+                                        pair: "PairState") -> None:
+        """Reintenta confirmar 'open' de ambos legs cada 30s hasta lograrlo."""
+        done_a = done_b = False
+        while not self._stop.is_set() and not (done_a and done_b):
+            await asyncio.sleep(30)
+            if not done_a:
+                done_a = await self._confirm_entry_open(cid_a, entry_a_px)
+            if not done_b:
+                done_b = await self._confirm_entry_open(cid_b, entry_b_px)
+        if done_a and done_b:
+            if pair.open_position is not None:
+                pair.open_position.pop("_db_unconfirmed", None)
+            logger.info("[PAIR] confirm 'open' reintentado OK (%s,%s)",
+                        cid_a, cid_b)
+            await self.tg.send(
+                f"✅ DB reconciliada: pair legs {cid_a}/{cid_b} ahora 'open'.",
+                parse_mode=None)
 
     # ---- Equity, snapshots, session monitor, daily ----
 
