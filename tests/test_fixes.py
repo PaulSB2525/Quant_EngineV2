@@ -1,27 +1,19 @@
 """
-verify_fixes.py — Verificación de los fixes críticos C-1..C-5 (FIX 3).
+tests/test_fixes.py — Tests de los fixes críticos C-1..C-5 + reconciliador de
+arranque (GAP 1/GAP 2).
 
 Ejercita el CÓDIGO REAL de bot_core con dobles en memoria (fake broker + fake
-pool Postgres) sin tocar exchanges ni DB. Cubre:
+pool Postgres), sin tocar exchanges ni DB.
 
-    A. Outbox single-asset: broker OK pero confirmación DB falla → fila queda
-       'pending', open_position seteado (bloquea reentrada), alerta enviada.
-    B. Reconciliador de singles NO cierra pares (status sigue 'open').
-    C. Cierre de par por TP: ambos legs cerrados, 'closed' exit_reason='tp',
-       open_position liberado.
-    D. Fallo al cerrar leg B tras cerrar leg A → 'pair_leg_b_close_failed',
-       par bloqueado, alerta.
-
-Uso:  python3 verify_fixes.py     (sale 0 si todo pasa)
+Ejecutar:  pytest tests/ -v
+(asyncio_mode=auto en pytest.ini → los `async def test_*` se ejecutan directo.)
 """
 
 from __future__ import annotations
 
-import asyncio
 import datetime as dt
-import sys
+import json
 from types import SimpleNamespace
-from zoneinfo import ZoneInfo
 
 from broker_adapters import OrderResult
 from bot_core import AssetState, BotConfig, PairState, TradingBot, UTC
@@ -68,10 +60,7 @@ class FakeAcquire:
 
 
 class FakePool:
-    """
-    DB en memoria. Tabla `trades` = dict[client_order_id] -> row dict.
-    Honra el WHERE relevante de cada query usada por el código.
-    """
+    """DB en memoria. Honra el WHERE relevante de cada query del código."""
     def __init__(self, fail_confirm_open=False):
         self.rows: dict[str, dict] = {}
         self.fail_confirm_open = fail_confirm_open
@@ -107,8 +96,6 @@ class FakePool:
         return out
 
     def _apply(self, sql, args):
-        # Normalizamos para discriminar por la cláusula SET (varios statements
-        # comparten subcadenas como status='open' en su WHERE).
         s = " ".join(sql.split()).lower()
         coid = args[0]
         if "insert into trades" in s:
@@ -142,7 +129,7 @@ class FakePool:
 
     async def fetch(self, sql, *args):
         if "status = any" in " ".join(sql.split()).lower():
-            problem = set(args[0])              # _unresolved_alert_loop
+            problem = set(args[0])            # _unresolved_alert_loop
             return [r for r in self.rows.values() if r.get("status") in problem]
         return self._match(sql, args)
 
@@ -193,7 +180,12 @@ class FakeBroker:
         return 101.0
 
 
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+
 def _bot(pool):
+    import asyncio
     bot = TradingBot(BotConfig())
     bot.pg_pool = pool
     bot.tg = FakeTelegram()
@@ -209,68 +201,7 @@ def _decision():
 
 
 def _check(name, cond):
-    print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
-    return cond
-
-
-# ----------------------------------------------------------------------------
-# Escenarios
-# ----------------------------------------------------------------------------
-
-async def scenario_A():
-    print("Escenario A — outbox single: confirmación DB falla")
-    pool = FakePool(fail_confirm_open=True)
-    bot = _bot(pool)
-    broker = FakeBroker(bracket_ok=True)
-    bot.brokers = {AssetClass.CRYPTO: broker}
-    st = AssetState("CRYPTO:BTC/USDT", 240, 1500)
-    bot.states["CRYPTO:BTC/USDT"] = st
-
-    await bot._execute_single_entry(st, "long", _decision(), 100.0)
-
-    coid = st.open_position["client_id"] if st.open_position else None
-    ok = True
-    ok &= _check("fila quedó 'pending' (no 'open')",
-                 coid is not None and pool.rows[coid]["status"] == "pending")
-    ok &= _check("open_position seteado (bloquea reentrada)",
-                 st.open_position is not None
-                 and st.open_position.get("_db_unconfirmed") is True)
-    ok &= _check("alerta CRÍTICA enviada",
-                 any("CRÍTICO" in m for m in bot.tg.messages))
-    bot._stop.set()
-    for t in list(bot._bg_tasks):
-        t.cancel()
-    return ok
-
-
-async def scenario_B():
-    print("Escenario B — reconciliador no toca pares")
-    pool = FakePool()
-    pool.seed(client_order_id="single1", symbol="CRYPTO:BTC/USDT",
-              asset_class="crypto", side="long", status="open",
-              pair_partner=None, entry_price=100.0, size_base=1.0)
-    pool.seed(client_order_id="pairlegA", symbol="CRYPTO:ETH/USDT",
-              asset_class="crypto", side="long", status="open",
-              pair_partner="CRYPTO:BTC/USDT", entry_price=50.0, size_base=2.0)
-    bot = _bot(pool)
-    bot.brokers = {AssetClass.CRYPTO: FakeBroker(open_orders=[])}
-    bot.cfg.reconciliation_period_secs = 0.02
-
-    task = asyncio.create_task(bot._order_reconciliation_loop())
-    await asyncio.sleep(0.15)
-    bot._stop.set()
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-
-    ok = True
-    ok &= _check("single SÍ se cerró (sin protección viva)",
-                 pool.rows["single1"]["status"] == "closed")
-    ok &= _check("pair leg NO se tocó (sigue 'open')",
-                 pool.rows["pairlegA"]["status"] == "open")
-    return ok
+    assert cond, name
 
 
 def _coint():
@@ -280,7 +211,6 @@ def _coint():
 
 
 def _ou_at(mu):
-    # OU operable centrado en mu → z(mu)=0 (dispara TP).
     return OUParams(theta=1.0, mu=mu, sigma=0.1, half_life=0.69, dt=1.0)
 
 
@@ -289,7 +219,7 @@ def _pair_with_position(broker_b_ok=True):
     bot = _bot(pool)
     broker_a = FakeBroker(market_ok=True)
     broker_b = FakeBroker(market_ok=broker_b_ok)
-    bot.brokers = {AssetClass.CRYPTO: broker_a}   # se sobreescribe abajo
+    bot.brokers = {AssetClass.CRYPTO: broker_a}
     sa = AssetState("CRYPTO:ETH/USDT", 240, 1500)
     sb = AssetState("CRYPTO:BTC/USDT", 240, 1500)
     sa.kalman = SimpleNamespace(x=100.0)
@@ -299,12 +229,9 @@ def _pair_with_position(broker_b_ok=True):
     sb.last_tick_ts = now
     bot.states[sa.asset_string] = sa
     bot.states[sb.asset_string] = sb
-    # Brokers distintos por símbolo: ambos crypto, pero queremos control
-    # independiente del leg B. Usamos un broker por asset_class; para distinguir
-    # legs forzamos que el cierre de B falle vía un broker dedicado.
     pair = PairState(sa.asset_string, sb.asset_string)
     pair.coint_params = _coint()
-    current_spread = 0.0  # log(100)-1*log(100)-0 = 0
+    current_spread = 0.0
     pair.spread_ou = _ou_at(current_spread)
     pair.open_position = {
         "client_id_a": "cidA", "client_id_b": "cidB",
@@ -323,61 +250,7 @@ def _pair_with_position(broker_b_ok=True):
     return bot, pool, pair, broker_a, broker_b
 
 
-async def scenario_C():
-    print("Escenario C — cierre de par por TP")
-    bot, pool, pair, broker_a, broker_b = _pair_with_position()
-    # Ambos legs son crypto → mismo broker; basta uno que cierre OK.
-    bot.brokers = {AssetClass.CRYPTO: broker_a}
-
-    await bot._maybe_exit_pair(pair)
-
-    ok = True
-    ok &= _check("leg A 'closed' exit_reason='tp'",
-                 pool.rows["cidA"]["status"] == "closed"
-                 and pool.rows["cidA"].get("exit_reason") == "tp")
-    ok &= _check("leg B 'closed' exit_reason='tp'",
-                 pool.rows["cidB"]["status"] == "closed"
-                 and pool.rows["cidB"].get("exit_reason") == "tp")
-    ok &= _check("open_position liberado (None)", pair.open_position is None)
-    ok &= _check("se enviaron ≥2 market de cierre",
-                 len(broker_a.market_calls) >= 2)
-    return ok
-
-
-async def scenario_D():
-    print("Escenario D — fallo al cerrar leg B tras cerrar leg A")
-    bot, pool, pair, broker_a, broker_b = _pair_with_position(broker_b_ok=False)
-
-    # Broker que cierra A OK pero B falla. Como ambos son crypto, usamos un
-    # broker cuyo submit_market_order falle SOLO para el símbolo del leg B.
-    class SplitBroker(FakeBroker):
-        async def submit_market_order(self, asset_string, side, size_base, coid):
-            self.market_calls.append((asset_string, side, size_base))
-            if asset_string == pair.sym_b:
-                return OrderResult(success=False, broker_order_id=None,
-                                   client_order_id=coid, error="leg B down")
-            return OrderResult(success=True, broker_order_id="m1",
-                               client_order_id=coid, avg_price=100.0)
-
-    sb_broker = SplitBroker()
-    bot.brokers = {AssetClass.CRYPTO: sb_broker}
-
-    await bot._maybe_exit_pair(pair)
-
-    ok = True
-    ok &= _check("leg A cerrado", pool.rows["cidA"]["status"] == "closed")
-    ok &= _check("leg B marcado 'pair_leg_b_close_failed'",
-                 pool.rows["cidB"]["status"] == "pair_leg_b_close_failed")
-    ok &= _check("par bloqueado (sentinela)",
-                 pair.open_position is not None
-                 and pair.open_position.get("status") == "pair_leg_b_close_failed")
-    ok &= _check("alerta enviada",
-                 any("LEG B CLOSE FAILED" in m for m in bot.tg.messages))
-    return ok
-
-
 def _recon_json():
-    import json
     recon = {
         "pair_side": "long_spread", "sym_a": "CRYPTO:ETH/USDT",
         "sym_b": "CRYPTO:BTC/USDT", "cid_a": "cidA", "cid_b": "cidB",
@@ -394,12 +267,103 @@ def _recon_json():
     return json.dumps({"_recon": recon})
 
 
-async def scenario_E():
-    print("Escenario E — startup: pending single con posición viva → open")
+# ----------------------------------------------------------------------------
+# Tests — fixes C-1..C-5
+# ----------------------------------------------------------------------------
+
+async def test_scenario_a_outbox_single_db_confirm_fails():
+    pool = FakePool(fail_confirm_open=True)
+    bot = _bot(pool)
+    bot.brokers = {AssetClass.CRYPTO: FakeBroker(bracket_ok=True)}
+    st = AssetState("CRYPTO:BTC/USDT", 240, 1500)
+    bot.states["CRYPTO:BTC/USDT"] = st
+
+    await bot._execute_single_entry(st, "long", _decision(), 100.0)
+
+    coid = st.open_position["client_id"] if st.open_position else None
+    _check("fila quedó 'pending'",
+           coid is not None and pool.rows[coid]["status"] == "pending")
+    _check("open_position bloquea reentrada",
+           st.open_position is not None
+           and st.open_position.get("_db_unconfirmed") is True)
+    _check("alerta CRÍTICA enviada", any("CRÍTICO" in m for m in bot.tg.messages))
+    bot._stop.set()
+    for t in list(bot._bg_tasks):
+        t.cancel()
+
+
+async def test_scenario_b_reconciler_skips_pairs():
+    import asyncio
     pool = FakePool()
-    pool.seed(client_order_id="p1", symbol="CRYPTO:BTC/USDT",
-              asset_class="crypto", side="long", status="pending",
-              pair_partner=None, entry_price=100.0, size_base=1.0)
+    pool.seed(client_order_id="single1", symbol="CRYPTO:BTC/USDT",
+              status="open", pair_partner=None)
+    pool.seed(client_order_id="pairlegA", symbol="CRYPTO:ETH/USDT",
+              status="open", pair_partner="CRYPTO:BTC/USDT")
+    bot = _bot(pool)
+    bot.brokers = {AssetClass.CRYPTO: FakeBroker(open_orders=[])}
+    bot.cfg.reconciliation_period_secs = 0.02
+
+    task = asyncio.create_task(bot._order_reconciliation_loop())
+    await asyncio.sleep(0.15)
+    bot._stop.set()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    _check("single SÍ se cerró", pool.rows["single1"]["status"] == "closed")
+    _check("pair leg NO se tocó", pool.rows["pairlegA"]["status"] == "open")
+
+
+async def test_scenario_c_pair_exit_tp():
+    bot, pool, pair, broker_a, _ = _pair_with_position()
+    bot.brokers = {AssetClass.CRYPTO: broker_a}
+
+    await bot._maybe_exit_pair(pair)
+
+    _check("leg A closed/tp", pool.rows["cidA"]["status"] == "closed"
+           and pool.rows["cidA"].get("exit_reason") == "tp")
+    _check("leg B closed/tp", pool.rows["cidB"]["status"] == "closed"
+           and pool.rows["cidB"].get("exit_reason") == "tp")
+    _check("open_position liberado", pair.open_position is None)
+    _check("≥2 market de cierre", len(broker_a.market_calls) >= 2)
+
+
+async def test_scenario_d_pair_leg_b_close_fail():
+    bot, pool, pair, _, _ = _pair_with_position()
+
+    class SplitBroker(FakeBroker):
+        async def submit_market_order(self, asset_string, side, size_base, coid):
+            self.market_calls.append((asset_string, side, size_base))
+            if asset_string == pair.sym_b:
+                return OrderResult(success=False, broker_order_id=None,
+                                   client_order_id=coid, error="leg B down")
+            return OrderResult(success=True, broker_order_id="m1",
+                               client_order_id=coid, avg_price=100.0)
+
+    bot.brokers = {AssetClass.CRYPTO: SplitBroker()}
+
+    await bot._maybe_exit_pair(pair)
+
+    _check("leg A cerrado", pool.rows["cidA"]["status"] == "closed")
+    _check("leg B pair_leg_b_close_failed",
+           pool.rows["cidB"]["status"] == "pair_leg_b_close_failed")
+    _check("par bloqueado",
+           pair.open_position is not None
+           and pair.open_position.get("status") == "pair_leg_b_close_failed")
+    _check("alerta enviada",
+           any("LEG B CLOSE FAILED" in m for m in bot.tg.messages))
+
+
+# ----------------------------------------------------------------------------
+# Tests — reconciliador de arranque (GAP 1/GAP 2)
+# ----------------------------------------------------------------------------
+
+async def test_startup_reconciler_pending_resolves_to_open():
+    pool = FakePool()
+    pool.seed(client_order_id="p1", symbol="CRYPTO:BTC/USDT", side="long",
+              status="pending", pair_partner=None)
     bot = _bot(pool)
     bot.brokers = {AssetClass.CRYPTO: FakeBroker(
         positions={"CRYPTO:BTC/USDT": 1.0})}
@@ -407,44 +371,39 @@ async def scenario_E():
 
     await bot._startup_reconciler()
 
-    ok = True
-    ok &= _check("pending → open", pool.rows["p1"]["status"] == "open")
-    ok &= _check("open_position reconstruido",
-                 bot.states["CRYPTO:BTC/USDT"].open_position is not None)
-    return ok
+    _check("pending → open", pool.rows["p1"]["status"] == "open")
+    _check("open_position reconstruido",
+           bot.states["CRYPTO:BTC/USDT"].open_position is not None)
 
 
-async def scenario_F():
-    print("Escenario F — startup: pending single sin posición ni fill → failed")
+async def test_startup_reconciler_pending_no_position_marks_failed():
     pool = FakePool()
-    pool.seed(client_order_id="p2", symbol="CRYPTO:BTC/USDT",
-              asset_class="crypto", side="long", status="pending",
-              pair_partner=None)
+    pool.seed(client_order_id="p2", symbol="CRYPTO:BTC/USDT", side="long",
+              status="pending", pair_partner=None)
     bot = _bot(pool)
 
     class NoFillBroker(FakeBroker):
         async def fetch_recent_fill_price(self, *a, **k):
             return None
+
     bot.brokers = {AssetClass.CRYPTO: NoFillBroker(
         positions={"CRYPTO:BTC/USDT": 0.0})}
     bot.states["CRYPTO:BTC/USDT"] = AssetState("CRYPTO:BTC/USDT", 240, 1500)
 
     await bot._startup_reconciler()
 
-    ok = _check("pending → failed_no_position",
-                pool.rows["p2"]["status"] == "failed_no_position")
-    return ok
+    _check("pending → failed_no_position",
+           pool.rows["p2"]["status"] == "failed_no_position")
 
 
-async def scenario_G():
-    print("Escenario G — startup: par open reconstruido en memoria")
+async def test_startup_reconciler_pair_reconstructed_in_memory():
     pool = FakePool()
-    pool.seed(client_order_id="cidA", symbol="CRYPTO:ETH/USDT",
-              asset_class="crypto", side="long", status="open",
-              pair_partner="CRYPTO:BTC/USDT", risk_metrics=_recon_json())
-    pool.seed(client_order_id="cidB", symbol="CRYPTO:BTC/USDT",
-              asset_class="crypto", side="short", status="open",
-              pair_partner="CRYPTO:ETH/USDT", risk_metrics=_recon_json())
+    pool.seed(client_order_id="cidA", symbol="CRYPTO:ETH/USDT", side="long",
+              status="open", pair_partner="CRYPTO:BTC/USDT",
+              risk_metrics=_recon_json())
+    pool.seed(client_order_id="cidB", symbol="CRYPTO:BTC/USDT", side="short",
+              status="open", pair_partner="CRYPTO:ETH/USDT",
+              risk_metrics=_recon_json())
     bot = _bot(pool)
     bot.brokers = {AssetClass.CRYPTO: FakeBroker(positions={
         "CRYPTO:ETH/USDT": 1.0, "CRYPTO:BTC/USDT": 1.0})}
@@ -453,26 +412,22 @@ async def scenario_G():
 
     await bot._startup_reconciler()
 
-    ok = True
-    ok &= _check("pair.open_position reconstruido",
-                 pair.open_position is not None
-                 and pair.open_position.get("side") == "long_spread")
-    ok &= _check("coint_params rehidratado", pair.coint_params is not None)
-    ok &= _check("spread_ou rehidratado", pair.spread_ou is not None)
-    return ok
+    _check("pair.open_position reconstruido",
+           pair.open_position is not None
+           and pair.open_position.get("side") == "long_spread")
+    _check("coint_params rehidratado", pair.coint_params is not None)
+    _check("spread_ou rehidratado", pair.spread_ou is not None)
 
 
-async def scenario_H():
-    print("Escenario H — startup: par parcialmente cerrado externamente")
+async def test_startup_reconciler_pair_partially_closed_externally():
     pool = FakePool()
-    pool.seed(client_order_id="cidA", symbol="CRYPTO:ETH/USDT",
-              asset_class="crypto", side="long", status="open",
-              pair_partner="CRYPTO:BTC/USDT", risk_metrics=_recon_json())
-    pool.seed(client_order_id="cidB", symbol="CRYPTO:BTC/USDT",
-              asset_class="crypto", side="short", status="open",
-              pair_partner="CRYPTO:ETH/USDT", risk_metrics=_recon_json())
+    pool.seed(client_order_id="cidA", symbol="CRYPTO:ETH/USDT", side="long",
+              status="open", pair_partner="CRYPTO:BTC/USDT",
+              risk_metrics=_recon_json())
+    pool.seed(client_order_id="cidB", symbol="CRYPTO:BTC/USDT", side="short",
+              status="open", pair_partner="CRYPTO:ETH/USDT",
+              risk_metrics=_recon_json())
     bot = _bot(pool)
-    # Leg A vivo, leg B cerrado externamente (qty 0).
     broker = FakeBroker(positions={"CRYPTO:ETH/USDT": 1.0,
                                    "CRYPTO:BTC/USDT": 0.0})
     bot.brokers = {AssetClass.CRYPTO: broker}
@@ -481,30 +436,10 @@ async def scenario_H():
 
     await bot._startup_reconciler()
 
-    ok = True
-    ok &= _check("leg A cerrado (startup_partial_close)",
-                 pool.rows["cidA"]["status"] == "closed"
-                 and pool.rows["cidA"].get("exit_reason") == "startup_partial_close")
-    ok &= _check("leg B cerrado",
-                 pool.rows["cidB"]["status"] == "closed")
-    ok &= _check("se envió market de cierre del leg vivo",
-                 any(c[0] == "CRYPTO:ETH/USDT" for c in broker.market_calls))
-    ok &= _check("open_position liberado", pair.open_position is None)
-    return ok
-
-
-async def main():
-    results = []
-    scenarios = (scenario_A, scenario_B, scenario_C, scenario_D,
-                 scenario_E, scenario_F, scenario_G, scenario_H)
-    for fn in scenarios:
-        results.append(await fn())
-        print()
-    total = all(results)
-    print("=" * 60)
-    print(f"RESULTADO: {sum(results)}/{len(results)} escenarios PASS")
-    return 0 if total else 1
-
-
-if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    _check("leg A closed/startup_partial_close",
+           pool.rows["cidA"]["status"] == "closed"
+           and pool.rows["cidA"].get("exit_reason") == "startup_partial_close")
+    _check("leg B cerrado", pool.rows["cidB"]["status"] == "closed")
+    _check("market de cierre del leg vivo",
+           any(c[0] == "CRYPTO:ETH/USDT" for c in broker.market_calls))
+    _check("open_position liberado", pair.open_position is None)
