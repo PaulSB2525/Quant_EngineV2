@@ -1139,7 +1139,7 @@ class TradingBot:
                            entry_price, size_base,
                            EXTRACT(EPOCH FROM opened_at) AS opened_epoch
                       FROM trades
-                     WHERE status = 'open'
+                     WHERE status = 'open' AND pair_partner IS NULL
                 """)
                 for row in rows:
                     await self._reconcile_one_trade(row)
