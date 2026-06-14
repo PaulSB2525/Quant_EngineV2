@@ -591,6 +591,62 @@ Cointegration tests:
   Structural break:      β rolling std=8.86,    verdict=structural_break
 ```
 
+### Run the test suite
+
+The synchronization fixes (outbox, pair exit, startup reconciler) are covered
+by an async test suite that exercises the real `bot_core` code against in-memory
+doubles (fake broker + fake Postgres pool) — no exchange or DB needed:
+
+```bash
+pip install pytest pytest-asyncio   # included in requirements.txt
+pytest tests/ -v
+```
+
+Expected: `8 passed` (scenarios A–D for the critical fixes, plus four
+`test_startup_reconciler_*` for the restart gaps). Takes ~15s because two
+scenarios exercise the real retry/backoff timers.
+
+---
+
+## Trade status lifecycle
+
+Every order is persisted with the **outbox pattern**: a row is written
+**before** the broker call and only confirmed afterwards, so a crash never
+leaves a position the system can't see. The `status` column (TEXT) takes:
+
+| status | Meaning | Who sets it | Resolution |
+|---|---|---|---|
+| `pending` | Row written before sending to broker | outbox INSERT | → `open` on fill, or resolved by startup reconciler |
+| `open` | Fill confirmed, position live | `_confirm_entry_open` | Closed by reconciler (singles) / `_pair_exit_loop` (pairs) |
+| `closed` | Round-trip done (see `exit_reason`) | finalize / reconciler / pair exit | Terminal |
+| `canceled` | Order never executed (pair leg A failed, sibling aborted) | pair entry | Terminal |
+| `failed_unprotected` | Entry OK but SL/TP placement failed | `_handle_unprotected_single` | Emergency close in progress |
+| `orphaned` | Live position that could **not** be closed | emergency close exhausted | **Manual intervention** |
+| `failed_no_position` | Pending with no live position and no close fill | startup reconciler | Terminal |
+| `pair_leg_a_orphaned` | Pair leg B failed and rollback of A impossible | `_rollback_pair_leg_a` | **Manual intervention** |
+| `pair_leg_b_close_failed` | Leg A closed but leg B couldn't | pair exit / startup | **Manual intervention** |
+
+`exit_reason` values: `tp`, `sl`, `timeout`, `panic_close`, `emergency_close`,
+`rollback`, `startup_closed`, `startup_partial_close`, `startup_external_close`.
+
+Rows needing manual intervention (`orphaned`, `failed_unprotected`,
+`pair_leg_*`) are re-alerted to Telegram every `UNRESOLVED_ALERT_SECS`
+(default 600s) until resolved.
+
+### Known open gaps (next sprint)
+
+These are **not** addressed by the synchronization fixes and remain open:
+
+- **A-2 — PnL ignores fees.** `pnl_quote` is `direction·(exit−entry)·size`;
+  broker fees/commissions are not subtracted. Reported PnL is optimistic.
+- **M-2 — Money uses `float`, not `Decimal`.** DB columns are `NUMERIC(24,12)`
+  but Python computes in float; rounding error can accumulate.
+- **A-4 — Irregular sampling treated as 1s.** OU/GARCH and annualization assume
+  one sample/second, but ticks arrive at variable rate → half-life, vol caps
+  and alpha are mis-scaled.
+- **A-5 — GARCH variance frozen between refits.** `last_sigma2`/`last_eps` only
+  update on the hourly refit, so the forecast can use up-to-1h-stale variance.
+
 ---
 
 ## Configuration
@@ -734,15 +790,28 @@ leg_a_size_quote = kelly_final · current_equity
 leg_b_size_quote = leg_a_size_quote · |β|
 ```
 
-### Step 4 — Position monitoring (current limitation)
+### Step 4 — Position monitoring (automated)
 
 The `pair.open_position` dict stores the entry spread, SL/TP **in spread
-units**, and metadata. Currently the bot does **not** automatically close
-pair positions when the spread reaches SL/TP — this requires a separate
-monitor loop (see [TODOs](#roadmap-and-known-todos)).
+units**, and metadata. A dedicated `_pair_exit_loop` (every
+`PAIR_EXIT_CHECK_SECS`, default 5s) closes pair positions automatically on:
 
-Workaround for v2: manually monitor spread positions via the dashboard
-and exit through your broker if needed. v3 will automate this.
+- **Take-profit** — `|z| < PAIR_TP_Z_THRESHOLD` (default 0.3), the spread
+  reverted to the mean.
+- **Stop-loss** — the spread moved beyond `sl_spread_distance` (in spread
+  log-units) relative to `entry_spread`.
+- **Timeout** — held longer than `PAIR_MAX_HOLD_HOURS` (default 48h).
+
+Both legs are closed with verified retries; if leg A fails to close, leg B is
+left untouched and the close is retried next cycle; if leg B fails after A
+closed, the row is flagged `pair_leg_b_close_failed`, the pair is blocked and a
+Telegram alert is raised for manual intervention.
+
+**Restart safety:** on startup, `_startup_reconciler` rehydrates `open` pairs
+from the DB (`risk_metrics._recon`) so the exit loop resumes managing them.
+**Residual limit:** right after a restart, exit-by-z only resumes once price
+buffers refill (Kalman needs fresh ticks); until then the position is tracked
+but not actively exited.
 
 ---
 

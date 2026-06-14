@@ -31,6 +31,7 @@ Referencias v2:
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Tuple
@@ -271,10 +272,23 @@ def fit_garch(returns: np.ndarray) -> GARCHParams:
         raise ValueError("GARCH recibió NaN/Inf")
     var_r = float(np.var(r))
     x0 = np.array([float(np.mean(r)), 0.05 * var_r, 0.08, 0.90])
-    bounds = [(-0.1, 0.1), (1e-12, 10.0 * var_r), (1e-6, 0.5), (1e-6, 0.999)]
-    result = minimize(_garch_neg_loglik, x0, args=(r,),
-                      method="L-BFGS-B", bounds=bounds,
-                      options={"maxiter": 500, "ftol": 1e-9})
+    # Causa raíz del UserWarning 'An upper bound is less than the corresponding
+    # lower bound' que inundaba la consola con ticks rápidos de Binance Testnet:
+    # cuando los retornos son casi planos, var_r colapsa cerca de 0 y el bound
+    # de omega queda (1e-12, 10*var_r) con upper < lower. Clampamos el upper
+    # con un margen estricto sobre el lower para que L-BFGS-B nunca vea bounds
+    # inconsistentes y la advertencia no se emita.
+    omega_upper = max(10.0 * var_r, 1e-10)
+    bounds = [(-0.1, 0.1), (1e-12, omega_upper), (1e-6, 0.5), (1e-6, 0.999)]
+    # Belt-and-suspenders: si pese al clamp algún sub-warning de convergencia
+    # del optimizador filtra al stderr (p.ej. L-BFGS-B reportando "ABNORMAL
+    # TERMINATION IN LNSRCH"), lo silenciamos sólo durante este minimize sin
+    # afectar el filtro global de warnings del resto del proceso.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = minimize(_garch_neg_loglik, x0, args=(r,),
+                          method="L-BFGS-B", bounds=bounds,
+                          options={"maxiter": 500, "ftol": 1e-9})
     mu, omega, alpha, beta = result.x
     return GARCHParams(mu=float(mu), omega=float(omega),
                        alpha=float(alpha), beta=float(beta),
