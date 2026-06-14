@@ -498,6 +498,8 @@ class TradingBot:
                                  name="order_reconcile")
                 tg.create_task(self._unresolved_alert_loop(),
                                  name="unresolved_alert")
+                if self.pairs:
+                    tg.create_task(self._pair_exit_loop(), name="pair_exit")
         except* Exception as eg:
             # ExceptionGroup en Python 3.11+
             for e in eg.exceptions:
@@ -1167,7 +1169,12 @@ class TradingBot:
             # Sin protección viva: SL o TP se ejecutó. Reconstruimos el exit.
             opened_epoch = row["opened_epoch"]
             since_ms = int(float(opened_epoch) * 1000) if opened_epoch else None
-            exit_px = await broker.fetch_recent_fill_price(symbol, since_ms)
+            # El fill de salida es el lado OPUESTO al de entrada y posterior a la
+            # apertura: así no confundimos la entrada con la salida (A-6).
+            exit_side = "sell" if row["side"] == "long" else "buy"
+            exit_px = await broker.fetch_recent_fill_price(
+                symbol, since_ms, after_timestamp_ms=since_ms,
+                expected_side=exit_side)
 
             entry_px = (float(row["entry_price"])
                         if row["entry_price"] is not None else None)
@@ -1552,6 +1559,218 @@ class TradingBot:
             await self.tg.send(
                 f"✅ DB reconciliada: pair legs {cid_a}/{cid_b} ahora 'open'.",
                 parse_mode=None)
+
+    # ---- Cierre de pares (C-1) ----
+
+    async def _pair_exit_loop(self) -> None:
+        """
+        Loop dedicado de SALIDA de pares (C-1). Cada `pair_exit_check_secs`
+        revisa cada par con posición viva y la cierra si revierte a la media
+        (TP), si el spread se aleja más allá del SL, o por timeout.
+
+        Gestiona la posición en memoria (pair.open_position), que tiene todos
+        los datos de entrada. NOTA de límite: tras un reinicio del proceso esta
+        memoria se pierde; los pares 'open' en DB quedan sin gestionar hasta una
+        reentrada (ver sección de honestidad del reporte).
+        """
+        while not self._stop.is_set():
+            try:
+                await asyncio.sleep(self.cfg.pair_exit_check_secs)
+                for pair in self.pairs.values():
+                    pos = pair.open_position
+                    if pos is None:
+                        continue
+                    # Saltar sentinelas de error y posiciones no confirmadas.
+                    if pos.get("status") == "pair_leg_a_orphaned":
+                        continue
+                    if pos.get("_db_unconfirmed"):
+                        continue
+                    if "side" not in pos:   # no es una posición gestionable
+                        continue
+                    await self._maybe_exit_pair(pair)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("pair_exit_loop")
+
+    async def _maybe_exit_pair(self, pair: "PairState") -> None:
+        pos = pair.open_position
+        state_a = self.states.get(pair.sym_a)
+        state_b = self.states.get(pair.sym_b)
+        if state_a is None or state_b is None:
+            return
+        if state_a.kalman is None or state_b.kalman is None:
+            return
+        if pair.coint_params is None or pair.spread_ou is None:
+            return
+
+        # Frescura de precios: si algún leg no tiene tick reciente, no operar.
+        now_dt = dt.datetime.now(UTC)
+        for st in (state_a, state_b):
+            if st.last_tick_ts is None:
+                return
+            age = (now_dt - st.last_tick_ts).total_seconds()
+            if age > self.cfg.pair_price_max_age_secs:
+                logger.debug("[PAIR %s/%s] precio stale (%.0fs); skip salida.",
+                             pair.sym_a, pair.sym_b, age)
+                return
+
+        # Mismo cálculo de spread/z que la entrada.
+        latest_la = math.log(state_a.kalman.x)
+        latest_lb = math.log(state_b.kalman.x)
+        current_spread = (latest_la - pair.coint_params.beta * latest_lb
+                          - pair.coint_params.alpha)
+        z = pair_spread_zscore(latest_la, latest_lb,
+                                pair.coint_params, pair.spread_ou)
+
+        side = pos["side"]                      # 'long_spread' | 'short_spread'
+        entry_spread = pos.get("entry_spread")
+        sl_dist = pos.get("sl_spread_distance") or 0.0
+        opened_at = pos.get("opened_at", now_dt.timestamp())
+
+        exit_reason = None
+        # (a) TAKE PROFIT: el spread revirtió a la media.
+        if abs(z) < self.cfg.pair_tp_z_threshold:
+            exit_reason = "tp"
+        # (b) STOP LOSS en unidades de spread, relativo a la entrada.
+        elif sl_dist > 0 and entry_spread is not None:
+            if side == "long_spread" and current_spread <= entry_spread - sl_dist:
+                exit_reason = "sl"
+            elif side == "short_spread" and current_spread >= entry_spread + sl_dist:
+                exit_reason = "sl"
+        # (c) TIMEOUT.
+        if exit_reason is None:
+            held_h = (time.time() - opened_at) / 3600.0
+            if held_h >= self.cfg.pair_max_hold_hours:
+                exit_reason = "timeout"
+
+        if exit_reason is None:
+            return
+
+        await self._close_pair(pair, pos, exit_reason, z)
+
+    async def _close_pair(self, pair: "PairState", pos: dict,
+                           exit_reason: str, z: float) -> None:
+        """Cierra ambos legs con reintentos verificados y persiste el cierre."""
+        state_a = self.states.get(pair.sym_a)
+        state_b = self.states.get(pair.sym_b)
+        broker_a = self.brokers[state_a.asset_class]
+        broker_b = self.brokers[state_b.asset_class]
+
+        logger.info("[PAIR %s/%s] Cerrando (%s, z=%.3f).",
+                    pair.sym_a, pair.sym_b, exit_reason, z)
+
+        # 3a/3c — Cerrar leg A (3 intentos). Si falla, NO tocamos leg B (evita
+        # dejar B naked); reintentaremos el par completo en el próximo ciclo.
+        ok_a, exit_a = await self._close_pair_leg(
+            broker_a, pair.sym_a, pos["side_a"], pos["size_a_base"],
+            pos["opened_at"])
+        if not ok_a:
+            await self.tg.send(
+                f"🚨 PAIR {pair.sym_a}/{pair.sym_b}: cierre de leg A falló tras "
+                f"3 intentos; reintento en el próximo ciclo.", parse_mode=None)
+            return
+
+        # 3b/3d — Cerrar leg B (3 intentos). Si falla tras cerrar A, el par
+        # queda PARCIALMENTE cerrado: leg B abierto y naked.
+        ok_b, exit_b = await self._close_pair_leg(
+            broker_b, pair.sym_b, pos["side_b"], pos["size_b_base"],
+            pos["opened_at"])
+
+        cid_a = pos["client_id_a"]
+        cid_b = pos["client_id_b"]
+        pnl_a = self._leg_pnl(pos["side_a"], pos.get("entry_a"), exit_a,
+                              pos["size_a_base"])
+
+        if not ok_b:
+            # Leg A cerrado, leg B no → estado partido, bloquear par.
+            await self._finalize_trade_closed(
+                cid_a, pos.get("entry_a"), exit_a, pnl_a,
+                exit_reason=exit_reason, notes="leg A closed; leg B close FAILED")
+            await self._mark_status(
+                cid_b, "pair_leg_b_close_failed",
+                notes="leg A closed but leg B close failed; naked leg B")
+            pair.open_position = {"status": "pair_leg_b_close_failed",
+                                  "client_id_b": cid_b, "side_b": pos["side_b"],
+                                  "size_b_base": pos["size_b_base"],
+                                  "opened_at": time.time()}
+            await self.tg.send(
+                f"🆘 PAIR LEG B CLOSE FAILED {pair.sym_b} {pos['side_b']} "
+                f"size={pos['size_b_base']} coid={cid_b}: leg A cerrado, leg B "
+                f"naked. Par bloqueado, requiere intervención manual.",
+                parse_mode=None)
+            return
+
+        # Ambos legs cerrados: persistir y liberar el slot SOLO tras confirmar.
+        pnl_b = self._leg_pnl(pos["side_b"], pos.get("entry_b"), exit_b,
+                              pos["size_b_base"])
+        done_a = await self._finalize_trade_closed(
+            cid_a, pos.get("entry_a"), exit_a, pnl_a, exit_reason=exit_reason)
+        done_b = await self._finalize_trade_closed(
+            cid_b, pos.get("entry_b"), exit_b, pnl_b, exit_reason=exit_reason)
+        if done_a and done_b:
+            pair.open_position = None
+        else:
+            # El cierre en el exchange ocurrió pero la DB no confirmó; reintento
+            # en background para no perder el registro ni reabrir el par.
+            self._spawn_bg(self._retry_finalize_pair_closed(
+                pair, cid_a, cid_b, pos, exit_a, exit_b, pnl_a, pnl_b,
+                exit_reason, done_a, done_b))
+        total_pnl = (pnl_a or 0.0) + (pnl_b or 0.0)
+        await self.tg.send(
+            f"✅ *PAIR EXIT* `{pair.sym_a}/{pair.sym_b}` ({exit_reason})\n"
+            + self.tg.code_block(
+                f"z={z:.3f} exit_a={exit_a} exit_b={exit_b} "
+                f"pnl≈{total_pnl:.2f}"))
+
+    async def _close_pair_leg(self, broker, sym: str, entry_side: str,
+                               size_base: float, opened_at: float,
+                               attempts: int = 3) -> tuple[bool, Optional[float]]:
+        """Cierra un leg (lado opuesto al de entrada) con reintentos backoff."""
+        opp = "sell" if entry_side == "long" else "buy"
+        backoff = 2.0
+        for attempt in range(attempts):
+            res = await broker.submit_market_order(
+                sym, opp, size_base, broker.make_client_order_id(sym, opp))
+            if res.success:
+                exit_px = res.avg_price
+                if exit_px is None:
+                    # Fallback: buscar el fill de cierre (lado opuesto, posterior).
+                    exit_px = await broker.fetch_recent_fill_price(
+                        sym, after_timestamp_ms=int(opened_at * 1000),
+                        expected_side=opp)
+                return True, exit_px
+            logger.error("[PAIR] cierre leg %s intento %d/%d falló: %s",
+                         sym, attempt + 1, attempts, res.error)
+            await asyncio.sleep(backoff)
+            backoff *= 2
+        return False, None
+
+    @staticmethod
+    def _leg_pnl(entry_side: str, entry_px: Optional[float],
+                  exit_px: Optional[float], size_base: float) -> Optional[float]:
+        if entry_px is None or exit_px is None:
+            return None
+        direction = 1.0 if entry_side == "long" else -1.0
+        return direction * (exit_px - entry_px) * size_base
+
+    async def _retry_finalize_pair_closed(self, pair, cid_a, cid_b, pos,
+                                           exit_a, exit_b, pnl_a, pnl_b,
+                                           exit_reason, done_a, done_b) -> None:
+        while not self._stop.is_set() and not (done_a and done_b):
+            await asyncio.sleep(30)
+            if not done_a:
+                done_a = await self._finalize_trade_closed(
+                    cid_a, pos.get("entry_a"), exit_a, pnl_a,
+                    exit_reason=exit_reason)
+            if not done_b:
+                done_b = await self._finalize_trade_closed(
+                    cid_b, pos.get("entry_b"), exit_b, pnl_b,
+                    exit_reason=exit_reason)
+        if done_a and done_b:
+            pair.open_position = None
+            logger.info("[PAIR %s/%s] cierre persistido tras reintento.",
+                        pair.sym_a, pair.sym_b)
 
     # ---- Equity, snapshots, session monitor, daily ----
 

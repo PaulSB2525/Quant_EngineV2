@@ -195,9 +195,18 @@ class BaseBrokerAdapter(abc.ABC):
         return None
 
     async def fetch_recent_fill_price(self, asset_string: str,
-                                       since_ms: Optional[int] = None
+                                       since_ms: Optional[int] = None,
+                                       after_timestamp_ms: Optional[int] = None,
+                                       expected_side: Optional[str] = None
                                        ) -> Optional[float]:
-        """Precio del fill más reciente (exit del round-trip). None si se ignora."""
+        """
+        Precio del fill más reciente (exit del round-trip). None si se ignora.
+
+        after_timestamp_ms : solo considerar fills con timestamp >= a este valor
+                             (evita confundir el fill de ENTRADA con el de SALIDA).
+        expected_side      : 'buy'/'sell' — solo fills de este lado (el lado de
+                             cierre es el OPUESTO al de entrada).
+        """
         return None
 
     # ---- Helpers concretos ----
@@ -600,15 +609,30 @@ class BinanceBrokerAdapter(BaseBrokerAdapter):
             return None
 
     async def fetch_recent_fill_price(self, asset_string: str,
-                                       since_ms: Optional[int] = None
+                                       since_ms: Optional[int] = None,
+                                       after_timestamp_ms: Optional[int] = None,
+                                       expected_side: Optional[str] = None
                                        ) -> Optional[float]:
         native = self._native_symbol(asset_string)
         try:
             trades = await self._exchange.fetch_my_trades(
-                native, since=since_ms, limit=10)
+                native, since=since_ms, limit=50)
             if not trades:
                 return None
-            last = trades[-1]            # el más reciente = fill de salida
+            # Filtrado para no confundir el fill de ENTRADA con el de SALIDA:
+            #   - after_timestamp_ms: descarta fills anteriores (p.ej. la entrada).
+            #   - expected_side: el cierre es el lado OPUESTO al de entrada.
+            candidates = trades
+            if after_timestamp_ms is not None:
+                candidates = [t for t in candidates
+                              if (t.get("timestamp") or 0) >= after_timestamp_ms]
+            if expected_side is not None:
+                want = expected_side.lower()
+                candidates = [t for t in candidates
+                              if str(t.get("side", "")).lower() == want]
+            if not candidates:
+                return None
+            last = candidates[-1]        # el más reciente que cumple el filtro
             px = last.get("price") or last.get("average")
             return float(px) if px else None
         except Exception as e:
