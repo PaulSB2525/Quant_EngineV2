@@ -209,6 +209,18 @@ class BaseBrokerAdapter(abc.ABC):
         """
         return None
 
+    async def fetch_position(self, asset_string: str) -> Optional[float]:
+        """
+        Cantidad (en unidades base) de la posición abierta para `asset_string`.
+
+        Contrato CRÍTICO para el reconciliador de arranque:
+            - 0.0   -> respuesta DEFINITIVA: no hay posición (plano).
+            - >0    -> hay posición viva por esa cantidad.
+            - None  -> ESTADO DESCONOCIDO (red caída, 5xx, adapter sin soporte):
+                       el llamador NO debe cerrar ni dar por cerrada la posición.
+        """
+        return None
+
     # ---- Helpers concretos ----
 
     @staticmethod
@@ -605,6 +617,25 @@ class BinanceBrokerAdapter(BaseBrokerAdapter):
             # Fallo de red/exchange: estado desconocido. Devolvemos None para
             # que el reconciliador NO cierre el trade por error.
             logger.warning("Binance fetch_open_orders %s falló: %s",
+                            asset_string, e)
+            return None
+
+    async def fetch_position(self, asset_string: str) -> Optional[float]:
+        """
+        Spot: la 'posición' es el balance del activo base (BTC en BTC/USDT).
+        Devuelve el total (free+locked); 0.0 si plano; None ante error de red.
+        Caveat: en spot el balance incluye TODO el inventario de ese base, no
+        solo el de este trade — es una heurística de 'posición viva' para el
+        reconciliador de arranque, suficiente para distinguir plano vs no-plano.
+        """
+        native = self._native_symbol(asset_string)
+        base = native.split("/")[0]
+        try:
+            bal = await self._exchange.fetch_balance()
+            total = bal.get("total", {}).get(base, 0.0)
+            return float(total or 0.0)
+        except Exception as e:
+            logger.warning("Binance fetch_position %s falló: %s",
                             asset_string, e)
             return None
 
@@ -1208,6 +1239,27 @@ class AlpacaBrokerAdapter(BaseBrokerAdapter):
                 "cache previa: %s", e)
             return BalanceData(total_quote=0.0, available_quote=0.0,
                                 quote_currency=self.quote_currency)
+
+    async def fetch_position(self, asset_string: str) -> Optional[float]:
+        """
+        Cantidad neta de la posición Alpaca (negativa si short). 0.0 si no hay
+        posición (Alpaca responde 404 'position does not exist'); None ante
+        cualquier otro error (red/5xx) para no dar por cerrado lo desconocido.
+        """
+        native = self._native_symbol(asset_string)
+        loop = asyncio.get_event_loop()
+        try:
+            pos = await loop.run_in_executor(
+                None, self._trading_client.get_open_position, native)
+            return float(getattr(pos, "qty", 0.0) or 0.0)
+        except Exception as e:
+            status = getattr(e, "status_code", None)
+            msg = str(e).lower()
+            if status == 404 or "does not exist" in msg or "position not found" in msg:
+                return 0.0
+            logger.warning("Alpaca fetch_position %s falló: %s",
+                            asset_string, e)
+            return None
 
     @staticmethod
     def _native_symbol(asset_string: str) -> str:

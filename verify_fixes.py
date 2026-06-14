@@ -80,7 +80,31 @@ class FakePool:
         return FakeAcquire(self)
 
     def seed(self, **row):
-        self.rows[row["client_order_id"]] = row
+        full = {
+            "client_order_id": None, "symbol": None, "asset_class": "crypto",
+            "side": "long", "status": "open", "pair_partner": None,
+            "entry_price": 100.0, "size_base": 1.0, "size_quote": 100.0,
+            "risk_metrics": None, "opened_epoch": 1_700_000_000.0,
+        }
+        full.update(row)
+        self.rows[full["client_order_id"]] = full
+
+    def _match(self, sql, args):
+        s = " ".join(sql.split()).lower()
+        out = []
+        for r in self.rows.values():
+            if "where client_order_id=$1" in s and r["client_order_id"] != args[0]:
+                continue
+            if "status='pending'" in s and r.get("status") != "pending":
+                continue
+            if "status='open'" in s and r.get("status") != "open":
+                continue
+            if "pair_partner is null" in s and r.get("pair_partner") is not None:
+                continue
+            if "pair_partner is not null" in s and r.get("pair_partner") is None:
+                continue
+            out.append(r)
+        return out
 
     def _apply(self, sql, args):
         # Normalizamos para discriminar por la cláusula SET (varios statements
@@ -117,33 +141,27 @@ class FakePool:
             return
 
     async def fetch(self, sql, *args):
-        if "status = ANY" in sql:            # _unresolved_alert_loop
-            problem = set(args[0])
+        if "status = any" in " ".join(sql.split()).lower():
+            problem = set(args[0])              # _unresolved_alert_loop
             return [r for r in self.rows.values() if r.get("status") in problem]
-        # _order_reconciliation_loop
-        out = []
-        for r in self.rows.values():
-            if r.get("status") != "open":
-                continue
-            if "pair_partner IS NULL" in sql and r.get("pair_partner") is not None:
-                continue
-            out.append({
-                "client_order_id": r["client_order_id"], "symbol": r["symbol"],
-                "asset_class": r.get("asset_class", "crypto"),
-                "side": r.get("side", "long"),
-                "entry_price": r.get("entry_price", 100.0),
-                "size_base": r.get("size_base", 1.0),
-                "opened_epoch": 1_700_000_000.0,
-            })
-        return out
+        return self._match(sql, args)
+
+    async def fetchrow(self, sql, *args):
+        rows = self._match(sql, args)
+        return rows[0] if rows else None
 
 
 class FakeBroker:
-    def __init__(self, *, bracket_ok=True, market_ok=True, open_orders=None):
+    def __init__(self, *, bracket_ok=True, market_ok=True, open_orders=None,
+                 positions=None):
         self.bracket_ok = bracket_ok
         self.market_ok = market_ok
         self._open_orders = open_orders if open_orders is not None else []
+        self.positions = positions or {}     # asset_string -> qty (None=unknown)
         self.market_calls: list[tuple] = []
+
+    async def fetch_position(self, asset_string):
+        return self.positions.get(asset_string)
 
     @staticmethod
     def make_client_order_id(asset_string, side):
@@ -358,9 +376,128 @@ async def scenario_D():
     return ok
 
 
+def _recon_json():
+    import json
+    recon = {
+        "pair_side": "long_spread", "sym_a": "CRYPTO:ETH/USDT",
+        "sym_b": "CRYPTO:BTC/USDT", "cid_a": "cidA", "cid_b": "cidB",
+        "side_a": "long", "side_b": "short",
+        "entry_a": 100.0, "entry_b": 100.0,
+        "size_a_base": 1.0, "size_b_base": 1.0,
+        "size_a_quote": 100.0, "size_b_quote": 100.0,
+        "entry_spread": 0.0, "sl_spread_distance": 0.05,
+        "tp_spread_distance": 0.1,
+        "beta": 1.0, "alpha": 0.0,
+        "ou_theta": 1.0, "ou_mu": 0.0, "ou_sigma": 0.1,
+        "ou_half_life": 0.69, "ou_dt": 1.0,
+    }
+    return json.dumps({"_recon": recon})
+
+
+async def scenario_E():
+    print("Escenario E — startup: pending single con posición viva → open")
+    pool = FakePool()
+    pool.seed(client_order_id="p1", symbol="CRYPTO:BTC/USDT",
+              asset_class="crypto", side="long", status="pending",
+              pair_partner=None, entry_price=100.0, size_base=1.0)
+    bot = _bot(pool)
+    bot.brokers = {AssetClass.CRYPTO: FakeBroker(
+        positions={"CRYPTO:BTC/USDT": 1.0})}
+    bot.states["CRYPTO:BTC/USDT"] = AssetState("CRYPTO:BTC/USDT", 240, 1500)
+
+    await bot._startup_reconciler()
+
+    ok = True
+    ok &= _check("pending → open", pool.rows["p1"]["status"] == "open")
+    ok &= _check("open_position reconstruido",
+                 bot.states["CRYPTO:BTC/USDT"].open_position is not None)
+    return ok
+
+
+async def scenario_F():
+    print("Escenario F — startup: pending single sin posición ni fill → failed")
+    pool = FakePool()
+    pool.seed(client_order_id="p2", symbol="CRYPTO:BTC/USDT",
+              asset_class="crypto", side="long", status="pending",
+              pair_partner=None)
+    bot = _bot(pool)
+
+    class NoFillBroker(FakeBroker):
+        async def fetch_recent_fill_price(self, *a, **k):
+            return None
+    bot.brokers = {AssetClass.CRYPTO: NoFillBroker(
+        positions={"CRYPTO:BTC/USDT": 0.0})}
+    bot.states["CRYPTO:BTC/USDT"] = AssetState("CRYPTO:BTC/USDT", 240, 1500)
+
+    await bot._startup_reconciler()
+
+    ok = _check("pending → failed_no_position",
+                pool.rows["p2"]["status"] == "failed_no_position")
+    return ok
+
+
+async def scenario_G():
+    print("Escenario G — startup: par open reconstruido en memoria")
+    pool = FakePool()
+    pool.seed(client_order_id="cidA", symbol="CRYPTO:ETH/USDT",
+              asset_class="crypto", side="long", status="open",
+              pair_partner="CRYPTO:BTC/USDT", risk_metrics=_recon_json())
+    pool.seed(client_order_id="cidB", symbol="CRYPTO:BTC/USDT",
+              asset_class="crypto", side="short", status="open",
+              pair_partner="CRYPTO:ETH/USDT", risk_metrics=_recon_json())
+    bot = _bot(pool)
+    bot.brokers = {AssetClass.CRYPTO: FakeBroker(positions={
+        "CRYPTO:ETH/USDT": 1.0, "CRYPTO:BTC/USDT": 1.0})}
+    pair = PairState("CRYPTO:ETH/USDT", "CRYPTO:BTC/USDT")
+    bot.pairs[("CRYPTO:ETH/USDT", "CRYPTO:BTC/USDT")] = pair
+
+    await bot._startup_reconciler()
+
+    ok = True
+    ok &= _check("pair.open_position reconstruido",
+                 pair.open_position is not None
+                 and pair.open_position.get("side") == "long_spread")
+    ok &= _check("coint_params rehidratado", pair.coint_params is not None)
+    ok &= _check("spread_ou rehidratado", pair.spread_ou is not None)
+    return ok
+
+
+async def scenario_H():
+    print("Escenario H — startup: par parcialmente cerrado externamente")
+    pool = FakePool()
+    pool.seed(client_order_id="cidA", symbol="CRYPTO:ETH/USDT",
+              asset_class="crypto", side="long", status="open",
+              pair_partner="CRYPTO:BTC/USDT", risk_metrics=_recon_json())
+    pool.seed(client_order_id="cidB", symbol="CRYPTO:BTC/USDT",
+              asset_class="crypto", side="short", status="open",
+              pair_partner="CRYPTO:ETH/USDT", risk_metrics=_recon_json())
+    bot = _bot(pool)
+    # Leg A vivo, leg B cerrado externamente (qty 0).
+    broker = FakeBroker(positions={"CRYPTO:ETH/USDT": 1.0,
+                                   "CRYPTO:BTC/USDT": 0.0})
+    bot.brokers = {AssetClass.CRYPTO: broker}
+    pair = PairState("CRYPTO:ETH/USDT", "CRYPTO:BTC/USDT")
+    bot.pairs[("CRYPTO:ETH/USDT", "CRYPTO:BTC/USDT")] = pair
+
+    await bot._startup_reconciler()
+
+    ok = True
+    ok &= _check("leg A cerrado (startup_partial_close)",
+                 pool.rows["cidA"]["status"] == "closed"
+                 and pool.rows["cidA"].get("exit_reason") == "startup_partial_close")
+    ok &= _check("leg B cerrado",
+                 pool.rows["cidB"]["status"] == "closed")
+    ok &= _check("se envió market de cierre del leg vivo",
+                 any(c[0] == "CRYPTO:ETH/USDT" for c in broker.market_calls))
+    ok &= _check("open_position liberado", pair.open_position is None)
+    return ok
+
+
 async def main():
     results = []
-    for fn in (scenario_A, scenario_B, scenario_C, scenario_D):
+    scenarios = (scenario_A, scenario_B, scenario_C, scenario_D,
+                 scenario_E, scenario_F, scenario_G, scenario_H)
+    for fn in scenarios:
         results.append(await fn())
         print()
     total = all(results)

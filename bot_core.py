@@ -482,6 +482,12 @@ class TradingBot:
             f"Pairs: {len(self.pairs)}\nPaper: {self.cfg.paper_trading}"
         )
 
+        # Reconciliación de ARRANQUE: resuelve filas 'pending' y reconstruye
+        # pares 'open' en memoria ANTES de iniciar los loops de gestión, para
+        # cerrar los gaps de reinicio (filas pending huérfanas; pares open en
+        # DB invisibles al _pair_exit_loop).
+        await self._startup_reconciler()
+
         # Loops principales en TaskGroup
         try:
             async with asyncio.TaskGroup() as tg:
@@ -1392,6 +1398,34 @@ class TradingBot:
         side_a = "long" if side_a_broker == "buy" else "short"
         side_b = "long" if side_b_broker == "buy" else "short"
 
+        # ---- 1C: datos de RECONSTRUCCIÓN para el reconciliador de arranque ----
+        # Se persisten en risk_metrics._recon (JSONB ya existente) para poder
+        # rehidratar pair.open_position + coint_params + spread_ou tras un
+        # reinicio del proceso (GAP 2). entry_* son estimados al disparo; se
+        # confirman con el fill real al confirmar, pero el estimado basta para
+        # gestionar la salida tras reinicio.
+        entry_spread_est = (math.log(state_a.kalman.x)
+                            - pair.coint_params.beta * math.log(state_b.kalman.x)
+                            - pair.coint_params.alpha)
+        recon = {
+            "pair_side": decision.metrics.get("pair_side"),
+            "sym_a": pair.sym_a, "sym_b": pair.sym_b,
+            "cid_a": cid_a, "cid_b": cid_b,
+            "side_a": side_a, "side_b": side_b,
+            "entry_a": state_a.kalman.x, "entry_b": state_b.kalman.x,
+            "size_a_base": size_a_base, "size_b_base": size_b_base,
+            "size_a_quote": decision.leg_a_size_quote,
+            "size_b_quote": decision.leg_b_size_quote,
+            "entry_spread": entry_spread_est,
+            "sl_spread_distance": decision.stop_loss_price,
+            "tp_spread_distance": decision.take_profit_price,
+            "beta": pair.coint_params.beta, "alpha": pair.coint_params.alpha,
+            "ou_theta": pair.spread_ou.theta, "ou_mu": pair.spread_ou.mu,
+            "ou_sigma": pair.spread_ou.sigma,
+            "ou_half_life": pair.spread_ou.half_life, "ou_dt": pair.spread_ou.dt,
+        }
+        risk_metrics_json = json.dumps({**decision.metrics, "_recon": recon})
+
         # ---- OUTBOX (C-4): ambos legs 'pending' ANTES de enviar nada ----
         try:
             async with self.pg_pool.acquire() as conn:
@@ -1412,7 +1446,7 @@ class TradingBot:
                         ON CONFLICT (client_order_id) DO NOTHING
                     """, cid, sym, ac, side, partner, entry, size_q, size_b,
                         json.dumps({"reason": decision.reason}),
-                        json.dumps(decision.metrics))
+                        risk_metrics_json)
         except Exception as e:
             logger.exception("[PAIR %s/%s] No se pudo registrar 'pending'; "
                              "no se envían órdenes.", pair.sym_a, pair.sym_b)
@@ -1771,6 +1805,376 @@ class TradingBot:
             pair.open_position = None
             logger.info("[PAIR %s/%s] cierre persistido tras reintento.",
                         pair.sym_a, pair.sym_b)
+
+    # ---- Reconciliador de ARRANQUE (gaps de reinicio) ----
+
+    _STARTUP_DUST = 1e-9   # qty por debajo de esto = posición plana
+
+    def _broker_for(self, asset_class_value: str):
+        return next((b for ac, b in self.brokers.items()
+                     if ac.value == asset_class_value), None)
+
+    @staticmethod
+    def _loads_metrics(raw) -> dict:
+        """risk_metrics puede venir como str (JSONB sin codec) o dict."""
+        if raw is None:
+            return {}
+        if isinstance(raw, dict):
+            return raw
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+
+    async def _startup_reconciler(self) -> None:
+        """
+        Corre UNA VEZ al arrancar (tras conectar brokers, antes de los loops).
+        1A: resuelve filas 'pending'. 1B: rehidrata pares 'open' en memoria.
+        Presupuesto: <30s; si excede, se loguea WARNING.
+        """
+        if self.pg_pool is None:
+            return
+        t0 = time.time()
+        logger.info("Startup reconciler: iniciando…")
+        try:
+            await self._startup_resolve_pending()
+            await self._startup_resolve_open_pairs()
+        except Exception:
+            logger.exception("startup_reconciler error")
+        elapsed = time.time() - t0
+        if elapsed > 30:
+            logger.warning("Startup reconciler tardó %.1fs (>30s).", elapsed)
+        else:
+            logger.info("Startup reconciler completado en %.1fs.", elapsed)
+
+    # ---- 1A: filas pending ----
+
+    async def _startup_resolve_pending(self) -> None:
+        # Singles pending: resolución contra la posición del exchange.
+        rows = await self.pg_pool.fetch("""
+            SELECT client_order_id FROM trades
+             WHERE status='pending' AND pair_partner IS NULL
+        """)
+        for r in rows:
+            coid = r["client_order_id"]
+            resolved = await self._resolve_pending_single(coid)
+            if not resolved:
+                # Exchange desconocido: bloquear símbolo y reintentar en bg.
+                row = await self.pg_pool.fetchrow(
+                    "SELECT symbol FROM trades WHERE client_order_id=$1", coid)
+                sym = row["symbol"] if row else "?"
+                st = self.states.get(sym)
+                if st is not None and st.open_position is None:
+                    st.open_position = {"client_id": coid,
+                                        "status": "startup_unknown",
+                                        "opened_at": time.time()}
+                await self.tg.send(
+                    f"🚨 Arranque: exchange no responde para pending {sym} "
+                    f"(coid={coid}); símbolo bloqueado, reintentando.",
+                    parse_mode=None)
+                self._spawn_bg(self._startup_retry_pending(coid))
+
+        # Pending de pares: estado ambiguo (crash entre outbox y fills). Si hay
+        # posición viva en algún leg → naked/huérfano; si planos → cancelado.
+        prows = await self.pg_pool.fetch("""
+            SELECT client_order_id, symbol, asset_class FROM trades
+             WHERE status='pending' AND pair_partner IS NOT NULL
+        """)
+        for r in prows:
+            broker = self._broker_for(r["asset_class"])
+            qty = await broker.fetch_position(r["symbol"]) if broker else None
+            if qty is None:
+                await self._mark_status(
+                    r["client_order_id"], "orphaned",
+                    notes="startup: pending pair leg, exchange unknown")
+                await self.tg.send(
+                    f"🚨 Arranque: pair leg pending {r['symbol']} estado "
+                    f"desconocido → 'orphaned' (revisión manual).",
+                    parse_mode=None)
+            elif qty > self._STARTUP_DUST:
+                await self._mark_status(
+                    r["client_order_id"], "orphaned",
+                    notes="startup: pending pair leg with live naked position")
+                await self.tg.send(
+                    f"🆘 Arranque: pair leg pending {r['symbol']} con posición "
+                    f"viva naked → 'orphaned' (revisión manual).",
+                    parse_mode=None)
+            else:
+                await self._mark_status(
+                    r["client_order_id"], "canceled",
+                    notes="startup: pending pair leg, no position (canceled)")
+            logger.info("[STARTUP] pair leg pending %s resuelto (qty=%s).",
+                        r["symbol"], qty)
+
+    async def _resolve_pending_single(self, coid: str) -> bool:
+        """
+        Resuelve una fila single 'pending'. Devuelve False solo si el exchange
+        está en estado DESCONOCIDO (para reintentar); True si quedó resuelta
+        (open / closed / failed_no_position) o ya no está pending.
+        """
+        row = await self.pg_pool.fetchrow("""
+            SELECT client_order_id, symbol, asset_class, side, entry_price,
+                   size_base, EXTRACT(EPOCH FROM opened_at) AS opened_epoch
+              FROM trades
+             WHERE client_order_id=$1 AND status='pending'
+        """, coid)
+        if row is None:
+            return True   # ya no está pending
+        broker = self._broker_for(row["asset_class"])
+        if broker is None:
+            return True   # sin broker no podemos resolver; no reintentar
+        sym = row["symbol"]
+        qty = await broker.fetch_position(sym)
+        if qty is None:
+            return False  # desconocido → reintentar
+        side = row["side"]
+        entry_px = float(row["entry_price"]) if row["entry_price"] is not None else None
+        size_base = float(row["size_base"]) if row["size_base"] is not None else None
+
+        if qty > self._STARTUP_DUST:
+            # Posición viva: solo faltó confirmar. Pasar a open + memoria.
+            await self._confirm_entry_open(coid, entry_px)
+            st = self.states.get(sym)
+            if st is not None:
+                st.open_position = {"client_id": coid, "side": side,
+                                    "entry": entry_px, "size_base": size_base,
+                                    "opened_at": time.time()}
+            logger.info("[STARTUP] pending %s → open (posición viva qty=%s).",
+                        sym, qty)
+            return True
+
+        # Sin posición: ¿hubo cierre? Buscar fill del lado de salida.
+        opened_epoch = row["opened_epoch"]
+        after_ms = int(float(opened_epoch) * 1000) if opened_epoch else None
+        exit_side = "sell" if side == "long" else "buy"
+        exit_px = await broker.fetch_recent_fill_price(
+            sym, after_timestamp_ms=after_ms, expected_side=exit_side)
+        if exit_px is not None:
+            pnl = None
+            if entry_px is not None and size_base is not None:
+                direction = 1.0 if side == "long" else -1.0
+                pnl = direction * (exit_px - entry_px) * size_base
+            await self._finalize_trade_closed(
+                coid, entry_px, exit_px, pnl, exit_reason="startup_closed",
+                notes="resolved at startup: no live position, close fill found")
+            logger.info("[STARTUP] pending %s → closed (exit=%s).", sym, exit_px)
+        else:
+            await self._mark_status(
+                coid, "failed_no_position",
+                notes="startup: no live position and no close fill found")
+            logger.info("[STARTUP] pending %s → failed_no_position.", sym)
+        return True
+
+    async def _startup_retry_pending(self, coid: str) -> None:
+        while not self._stop.is_set():
+            await asyncio.sleep(60)
+            if await self._resolve_pending_single(coid):
+                logger.info("[STARTUP] pending %s resuelto tras reintento.", coid)
+                return
+
+    # ---- 1B: pares open sin gestión en memoria ----
+
+    async def _startup_resolve_open_pairs(self) -> None:
+        rows = await self.pg_pool.fetch("""
+            SELECT client_order_id, symbol, asset_class, side, entry_price,
+                   size_base, pair_partner, risk_metrics
+              FROM trades
+             WHERE status='open' AND pair_partner IS NOT NULL
+        """)
+        # Agrupar los dos legs por el conjunto {symbol, pair_partner}.
+        groups: dict[frozenset, list] = {}
+        for r in rows:
+            key = frozenset({r["symbol"], r["pair_partner"]})
+            groups.setdefault(key, []).append(r)
+
+        for key, legs in groups.items():
+            try:
+                await self._startup_resolve_one_pair(legs)
+            except Exception:
+                logger.exception("[STARTUP] error resolviendo par %s", set(key))
+
+    async def _startup_resolve_one_pair(self, legs: list) -> None:
+        # Localizar el PairState configurado para este conjunto de símbolos.
+        syms = {r["symbol"] for r in legs} | {r["pair_partner"] for r in legs}
+        pair = None
+        for (a, b), ps in self.pairs.items():
+            if {a, b} == syms:
+                pair = ps
+                break
+        if pair is None:
+            logger.warning("[STARTUP] par %s en DB pero no configurado; skip.",
+                           syms)
+            return
+
+        row_a = next((r for r in legs if r["symbol"] == pair.sym_a), None)
+        row_b = next((r for r in legs if r["symbol"] == pair.sym_b), None)
+        broker_a = self._broker_for(row_a["asset_class"]) if row_a else None
+        broker_b = self._broker_for(row_b["asset_class"]) if row_b else None
+        if not (row_a and row_b and broker_a and broker_b):
+            logger.warning("[STARTUP] par %s incompleto en DB; skip.", syms)
+            return
+
+        qty_a = await broker_a.fetch_position(pair.sym_a)
+        qty_b = await broker_b.fetch_position(pair.sym_b)
+        if qty_a is None or qty_b is None:
+            # Estado desconocido: bloquear par y reintentar en bg.
+            pair.open_position = {"status": "startup_unknown",
+                                  "opened_at": time.time()}
+            await self.tg.send(
+                f"🚨 Arranque: estado desconocido para par {pair.sym_a}/"
+                f"{pair.sym_b}; bloqueado, reintentando.", parse_mode=None)
+            self._spawn_bg(self._startup_retry_pair(legs))
+            return
+
+        live_a = abs(qty_a) > self._STARTUP_DUST
+        live_b = abs(qty_b) > self._STARTUP_DUST
+
+        if live_a and live_b:
+            ok = self._rehydrate_pair(pair, row_a, row_b)
+            if ok:
+                logger.info("[STARTUP] par %s/%s reconstruido en memoria.",
+                            pair.sym_a, pair.sym_b)
+                await self.tg.send(
+                    f"♻️ Arranque: par {pair.sym_a}/{pair.sym_b} reconstruido "
+                    f"desde DB; _pair_exit_loop lo gestionará.", parse_mode=None)
+            return
+
+        if live_a != live_b:
+            # Parcialmente cerrado externamente: cerrar el leg restante.
+            await self._startup_close_partial(pair, row_a, row_b,
+                                               live_a, live_b)
+            return
+
+        # Ninguno vivo: cerrado externamente. Registrar ambos con sus fills.
+        await self._startup_close_external(pair, row_a, row_b)
+
+    def _rehydrate_pair(self, pair: "PairState", row_a, row_b) -> bool:
+        recon = self._loads_metrics(row_a["risk_metrics"]).get("_recon") \
+                or self._loads_metrics(row_b["risk_metrics"]).get("_recon")
+        if not recon:
+            logger.warning("[STARTUP] par %s/%s sin _recon; no se puede "
+                           "reconstruir, queda bloqueado.",
+                           pair.sym_a, pair.sym_b)
+            pair.open_position = {"status": "startup_no_recon",
+                                  "opened_at": time.time()}
+            return False
+        try:
+            pair.coint_params = CointegrationParams(
+                beta=float(recon["beta"]), alpha=float(recon["alpha"]),
+                adf_statistic=-99.0, adf_pvalue=0.0,
+                spread_std=max(float(recon.get("ou_sigma", 0.01)), 1e-9),
+                verdict=CointegrationVerdict.COINTEGRATED, beta_rolling_std=0.0)
+            pair.spread_ou = OUParams(
+                theta=float(recon["ou_theta"]), mu=float(recon["ou_mu"]),
+                sigma=float(recon["ou_sigma"]),
+                half_life=float(recon["ou_half_life"]),
+                dt=float(recon["ou_dt"]))
+            pair.open_position = {
+                "client_id_a": row_a["client_order_id"],
+                "client_id_b": row_b["client_order_id"],
+                "side": recon["pair_side"],
+                "side_a": recon["side_a"], "side_b": recon["side_b"],
+                "entry_a": recon["entry_a"], "entry_b": recon["entry_b"],
+                "size_a_base": recon["size_a_base"],
+                "size_b_base": recon["size_b_base"],
+                "entry_spread": recon["entry_spread"],
+                "sl_spread_distance": recon["sl_spread_distance"],
+                "tp_spread_distance": recon.get("tp_spread_distance"),
+                "opened_at": time.time(),
+            }
+            return True
+        except (KeyError, TypeError, ValueError):
+            logger.exception("[STARTUP] _recon de %s/%s inválido; bloqueado.",
+                             pair.sym_a, pair.sym_b)
+            pair.open_position = {"status": "startup_no_recon",
+                                  "opened_at": time.time()}
+            return False
+
+    async def _startup_close_partial(self, pair, row_a, row_b,
+                                      live_a, live_b) -> None:
+        recon = self._loads_metrics(row_a["risk_metrics"]).get("_recon") \
+                or self._loads_metrics(row_b["risk_metrics"]).get("_recon") or {}
+        live_row = row_a if live_a else row_b
+        live_sym = pair.sym_a if live_a else pair.sym_b
+        live_side = (recon.get("side_a") if live_a else recon.get("side_b")) \
+            or live_row["side"]
+        size_base = float(live_row["size_base"]) if live_row["size_base"] else 0.0
+        broker = self._broker_for(live_row["asset_class"])
+        opened_at = time.time()
+        ok, exit_px = await self._close_pair_leg(
+            broker, live_sym, live_side, size_base, opened_at)
+        entry_px = (float(live_row["entry_price"])
+                    if live_row["entry_price"] is not None else None)
+        pnl = self._leg_pnl(live_side, entry_px, exit_px, size_base)
+        if ok:
+            await self._finalize_trade_closed(
+                live_row["client_order_id"], entry_px, exit_px, pnl,
+                exit_reason="startup_partial_close",
+                notes="startup: sibling leg closed externally; closed remaining")
+            # El leg ya cerrado externamente: marcarlo closed también.
+            closed_row = row_b if live_a else row_a
+            await self._finalize_trade_closed(
+                closed_row["client_order_id"],
+                (float(closed_row["entry_price"])
+                 if closed_row["entry_price"] is not None else None),
+                None, None, exit_reason="startup_partial_close",
+                notes="startup: closed externally (sibling of partial)")
+            pair.open_position = None
+            await self.tg.send(
+                f"♻️ Arranque: par {pair.sym_a}/{pair.sym_b} parcialmente "
+                f"cerrado externamente; cerrado leg restante {live_sym}.",
+                parse_mode=None)
+        else:
+            await self._mark_status(
+                live_row["client_order_id"], "pair_leg_b_close_failed",
+                notes="startup: failed to close remaining leg")
+            pair.open_position = {"status": "pair_leg_b_close_failed",
+                                  "opened_at": time.time()}
+            await self.tg.send(
+                f"🆘 Arranque: no se pudo cerrar leg restante {live_sym}; "
+                f"par bloqueado (revisión manual).", parse_mode=None)
+
+    async def _startup_close_external(self, pair, row_a, row_b) -> None:
+        for row, sym, side_key in ((row_a, pair.sym_a, "side_a"),
+                                    (row_b, pair.sym_b, "side_b")):
+            recon = self._loads_metrics(row["risk_metrics"]).get("_recon") or {}
+            side = recon.get(side_key) or row["side"]
+            entry_px = (float(row["entry_price"])
+                        if row["entry_price"] is not None else None)
+            size_base = float(row["size_base"]) if row["size_base"] else 0.0
+            broker = self._broker_for(row["asset_class"])
+            opened_epoch_ms = None  # no disponemos del epoch aquí; sin filtro ts
+            exit_side = "sell" if side == "long" else "buy"
+            exit_px = await broker.fetch_recent_fill_price(
+                sym, after_timestamp_ms=opened_epoch_ms,
+                expected_side=exit_side) if broker else None
+            pnl = self._leg_pnl(side, entry_px, exit_px, size_base)
+            await self._finalize_trade_closed(
+                row["client_order_id"], entry_px, exit_px, pnl,
+                exit_reason="startup_external_close",
+                notes="startup: both legs flat; closed externally")
+        pair.open_position = None
+        logger.info("[STARTUP] par %s/%s cerrado externamente; registrado.",
+                    pair.sym_a, pair.sym_b)
+
+    async def _startup_retry_pair(self, legs: list) -> None:
+        while not self._stop.is_set():
+            await asyncio.sleep(60)
+            # Re-leer estado fresco de la DB de un leg para ver si sigue 'open'.
+            r = await self.pg_pool.fetchrow(
+                "SELECT status FROM trades WHERE client_order_id=$1",
+                legs[0]["client_order_id"])
+            if r is None or r["status"] != "open":
+                return
+            try:
+                await self._startup_resolve_one_pair(legs)
+                # Si quedó resuelto (no en estado unknown), salir.
+                # _startup_resolve_one_pair re-evalúa posiciones; si siguen
+                # desconocidas, vuelve a programar otro retry vía bg → evitamos
+                # duplicar saliendo aquí siempre tras un intento exitoso de I/O.
+                return
+            except Exception:
+                logger.exception("[STARTUP] retry par falló; reintentando.")
 
     # ---- Equity, snapshots, session monitor, daily ----
 
