@@ -127,6 +127,20 @@ class BotConfig:
     pair_decision_period_secs: float = 30.0
     reconciliation_period_secs: float = 12.0   # cierre SL/TP: poll cada 10-15s
 
+    # Outbox / resolución de estados problemáticos (C-3/C-4/C-5)
+    unresolved_alert_secs: int = field(
+        default_factory=lambda: int(os.getenv("UNRESOLVED_ALERT_SECS", "600")))
+    # Cierre de pares (C-1/C-2)
+    pair_exit_check_secs: float = field(
+        default_factory=lambda: float(os.getenv("PAIR_EXIT_CHECK_SECS", "5.0")))
+    pair_tp_z_threshold: float = field(
+        default_factory=lambda: float(os.getenv("PAIR_TP_Z_THRESHOLD", "0.3")))
+    pair_max_hold_hours: float = field(
+        default_factory=lambda: float(os.getenv("PAIR_MAX_HOLD_HOURS", "48.0")))
+    # Edad máxima del precio en caché para considerar fresca una señal de salida
+    pair_price_max_age_secs: float = field(
+        default_factory=lambda: float(os.getenv("PAIR_PRICE_MAX_AGE_SECS", "30.0")))
+
     # Quote currencies por asset class
     crypto_quote: str = "USDT"
     equity_quote: str = "USD"
@@ -213,12 +227,19 @@ CREATE TABLE IF NOT EXISTS trades (
     opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     closed_at TIMESTAMPTZ,
     status TEXT NOT NULL DEFAULT 'open',
+    exit_reason TEXT,
+    notes TEXT,
     reasoning JSONB,
     risk_metrics JSONB
 );
 CREATE INDEX IF NOT EXISTS idx_trades_symbol_opened ON trades(symbol, opened_at DESC);
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
 CREATE INDEX IF NOT EXISTS idx_trades_asset_class ON trades(asset_class);
+CREATE INDEX IF NOT EXISTS idx_trades_status_partner ON trades(status, pair_partner);
+
+-- Migración 002 (idempotente) para DBs creadas antes del patrón outbox:
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_reason TEXT;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS notes TEXT;
 
 CREATE TABLE IF NOT EXISTS equity_snapshots (
     ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -398,6 +419,9 @@ class TradingBot:
         self.states: dict[str, AssetState] = {}
         self.pairs: dict[tuple[str, str], PairState] = {}
         self._stop = asyncio.Event()
+        # Referencias fuertes a tareas fire-and-forget (retries de confirmación
+        # de DB) para que el GC no las destruya antes de completarse.
+        self._bg_tasks: set[asyncio.Task] = set()
 
     # ---- Lifecycle ----
 
@@ -472,6 +496,8 @@ class TradingBot:
                 tg.create_task(self._session_monitor_loop(), name="session_mon")
                 tg.create_task(self._order_reconciliation_loop(),
                                  name="order_reconcile")
+                tg.create_task(self._unresolved_alert_loop(),
+                                 name="unresolved_alert")
         except* Exception as eg:
             # ExceptionGroup en Python 3.11+
             for e in eg.exceptions:
@@ -808,6 +834,32 @@ class TradingBot:
             return
         broker_side = "buy" if side == "long" else "sell"
 
+        # ---- OUTBOX 1A: registrar 'pending' ANTES de enviar al broker ----
+        # Si esta escritura falla, NO se envía nada al broker: preferimos no
+        # operar a operar sin registro (C-3/C-4). entry_price se guarda como
+        # precio estimado y se sobreescribe con el fill real al confirmar 1B.
+        try:
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO trades
+                    (client_order_id, symbol, asset_class, side, entry_price,
+                     size_quote, size_base, status, reasoning, risk_metrics)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9)
+                    ON CONFLICT (client_order_id) DO NOTHING
+                """, client_id, state.asset_string, state.asset_class.value,
+                    side, current_price, decision.size_quote, size_base,
+                    json.dumps({"reason": decision.reason}),
+                    json.dumps(decision.metrics))
+        except Exception as e:
+            logger.exception(
+                "[%s] No se pudo registrar trade 'pending'; NO se envía la "
+                "orden al broker (sin registro = sin operación).",
+                state.asset_string)
+            await self.tg.send(
+                f"🚨 DB no disponible: orden {state.asset_string} {side} "
+                f"ABORTADA antes de enviar.\n{e}", parse_mode=None)
+            return
+
         result = await broker.submit_bracket_orders(
             asset_string=state.asset_string,
             side=broker_side,
@@ -820,83 +872,246 @@ class TradingBot:
             base_price=current_price,
         )
 
+        # ---- 1C: rutas de fallo explícitas ----
         if not result.success:
-            # Alerta de fallback/panic de Binance: el error de ccxt trae llaves,
-            # guiones y puntos. La enviamos como TEXTO PLANO (parse_mode=None)
-            # para que Telegram NO parsee entidades y nunca devuelva 400. En
-            # texto plano el error es seguro tal cual y no necesita code_block.
+            # Alerta como TEXTO PLANO (el error de ccxt trae llaves/guiones).
             await self.tg.send(
                 f"🚨 Ejecución falló {state.asset_string}:\n{result.error}",
                 parse_mode=None)
-            # Si el SL/TP falló y la posición se cerró por pánico en el exchange,
-            # el round-trip SÍ ocurrió (entrada + cierre con fees reales). Lo
-            # registramos como 'closed' para que la DB refleje el estado real y
-            # el Unrealized PnL no lo cuente como abierto. Si el cierre de pánico
-            # también falló (panic_closed=False), la posición sigue abierta en el
-            # exchange y NO escribimos un cierre falso: solo queda el alerta TG.
+            entry_px = result.avg_price or current_price
             if result.panic_closed:
-                entry_px = result.avg_price or current_price
+                # Round-trip real (entrada + cierre de pánico). Confirmamos la
+                # fila 'pending' -> 'closed' con el PnL real.
                 exit_px = result.exit_price
                 pnl_quote = None
                 if exit_px is not None:
                     direction = 1.0 if side == "long" else -1.0
                     pnl_quote = direction * (exit_px - entry_px) * size_base
-                async with self.pg_pool.acquire() as conn:
-                    await conn.execute("""
-                        INSERT INTO trades
-                        (client_order_id, symbol, asset_class, side, entry_price,
-                         exit_price, size_quote, size_base, pnl_quote, status,
-                         closed_at, reasoning, risk_metrics)
-                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'closed',NOW(),$10,$11)
-                        ON CONFLICT (client_order_id) DO UPDATE
-                          SET status='closed',
-                              exit_price=EXCLUDED.exit_price,
-                              pnl_quote=EXCLUDED.pnl_quote,
-                              closed_at=NOW()
-                    """, client_id, state.asset_string, state.asset_class.value,
-                        side, entry_px, exit_px, decision.size_quote, size_base,
-                        pnl_quote,
-                        json.dumps({"reason": decision.reason,
-                                    "panic_close": result.error}),
-                        json.dumps(decision.metrics))
+                await self._finalize_trade_closed(
+                    client_id, entry_px, exit_px, pnl_quote,
+                    exit_reason="panic_close",
+                    notes=(result.error or "")[:500])
+            else:
+                # Posición potencialmente ABIERTA sin protección (C-3).
+                await self._handle_unprotected_single(
+                    state, side, broker, client_id, size_base,
+                    entry_px=entry_px, err=result.error)
             return
 
-        state.open_position = {
+        # ---- 1B: éxito → confirmar 'pending' -> 'open' ----
+        entry_px = result.avg_price or current_price
+        position = {
             "client_id": client_id,
             "broker_id": result.broker_order_id,
             "side": side,
-            "entry": current_price,
+            "entry": entry_px,
             "size_base": size_base,
             "size_quote": decision.size_quote,
             "sl": decision.stop_loss_price,
             "tp": decision.take_profit_price,
             "opened_at": time.time(),
         }
+        # Marcamos open_position SIEMPRE tras un fill exitoso (la posición existe
+        # y está protegida en el exchange) para impedir doble entrada en el
+        # símbolo, incluso si el UPDATE de confirmación falla.
+        state.open_position = position
+        confirmed = await self._confirm_entry_open(client_id, entry_px)
+        if confirmed:
+            # El símbolo va en un inline code span (`...`): contenido literal en
+            # Markdown legacy y MarkdownV2; inmune a '_'/'*'/'.' sin escape.
+            await self.tg.send(
+                f"📈 *ENTRADA* `{state.asset_string}` `{side.upper()}`\n"
+                f"Size: `${decision.size_quote:,.2f}` ({size_base:.6f})\n"
+                f"Entry: `{entry_px:.4f}` SL: `{decision.stop_loss_price:.4f}` "
+                f"TP: `{decision.take_profit_price:.4f}`\n"
+                + self.tg.code_block(decision.reason[:200])
+            )
+        else:
+            # Broker OK pero Postgres no confirmó: la posición está viva y
+            # protegida; solo la DB quedó en 'pending'. Reintentamos en
+            # background y mantenemos el símbolo bloqueado hasta confirmar (C-4).
+            position["_db_unconfirmed"] = True
+            logger.critical(
+                "[%s] Orden %s ejecutada y protegida, pero UPDATE 'open' falló; "
+                "reintentando en background. Símbolo bloqueado hasta confirmar.",
+                state.asset_string, client_id)
+            await self.tg.send(
+                f"🚨 CRÍTICO {state.asset_string}: orden ejecutada pero la DB no "
+                f"confirmó 'open' (coid={client_id}). Reintentando en background; "
+                f"símbolo bloqueado.", parse_mode=None)
+            self._spawn_bg(
+                self._retry_confirm_open(client_id, entry_px, state))
 
-        async with self.pg_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO trades
-                (client_order_id, symbol, asset_class, side, entry_price,
-                 size_quote, size_base, status, reasoning, risk_metrics)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,'open',$8,$9)
-                ON CONFLICT (client_order_id) DO NOTHING
-            """, client_id, state.asset_string, state.asset_class.value,
-                side, current_price, decision.size_quote, size_base,
-                json.dumps({"reason": decision.reason}),
-                json.dumps(decision.metrics))
+    # ---- Helpers outbox / confirmación / cierre (C-3, C-4) ----
 
-        # El símbolo va en un inline code span (`...`): su contenido es literal
-        # tanto en Markdown legacy como en MarkdownV2, así un ticker futuro con
-        # '_', '*' o '.' nunca rompe el parser ni dispara el HTTP 400. NO usamos
-        # escape_mdv2() aquí porque este send viaja en parse_mode="Markdown"
-        # legacy, que no honra los backslashes de escape (se verían crudos).
+    def _spawn_bg(self, coro) -> None:
+        """Lanza una corrutina fire-and-forget conservando referencia fuerte."""
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def _confirm_entry_open(self, client_id: str,
+                                   entry_px: Optional[float]) -> bool:
+        """UPDATE 'pending' -> 'open' con el precio de fill real. True si OK."""
+        try:
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute("""
+                    UPDATE trades
+                       SET status='open',
+                           entry_price=COALESCE($2, entry_price)
+                     WHERE client_order_id=$1 AND status='pending'
+                """, client_id, entry_px)
+            return True
+        except Exception:
+            logger.exception("confirm 'open' falló coid=%s", client_id)
+            return False
+
+    async def _retry_confirm_open(self, client_id: str,
+                                   entry_px: Optional[float],
+                                   state: "AssetState") -> None:
+        """Reintenta el UPDATE 'open' cada 30s hasta lograrlo (o stop)."""
+        while not self._stop.is_set():
+            await asyncio.sleep(30)
+            if await self._confirm_entry_open(client_id, entry_px):
+                logger.info("[%s] confirm 'open' reintentado OK coid=%s",
+                            state.asset_string, client_id)
+                pos = state.open_position
+                if pos is not None and pos.get("client_id") == client_id:
+                    pos.pop("_db_unconfirmed", None)
+                await self.tg.send(
+                    f"✅ DB reconciliada: {state.asset_string} coid={client_id} "
+                    f"ahora 'open'.", parse_mode=None)
+                return
+
+    async def _finalize_trade_closed(self, client_id: str,
+                                      entry_px: Optional[float],
+                                      exit_px: Optional[float],
+                                      pnl_quote: Optional[float], *,
+                                      exit_reason: str, notes: str = "") -> bool:
+        """UPDATE 'pending'/'open' -> 'closed'. Un reintento ante fallo."""
+        for attempt in range(2):
+            try:
+                async with self.pg_pool.acquire() as conn:
+                    await conn.execute("""
+                        UPDATE trades
+                           SET status='closed',
+                               entry_price=COALESCE($2, entry_price),
+                               exit_price=$3, pnl_quote=$4, closed_at=NOW(),
+                               exit_reason=$5, notes=$6
+                         WHERE client_order_id=$1
+                           AND status IN ('pending','open','failed_unprotected')
+                    """, client_id, entry_px, exit_px, pnl_quote,
+                        exit_reason, notes)
+                return True
+            except Exception:
+                logger.exception("finalize 'closed' falló coid=%s (intento %d)",
+                                 client_id, attempt + 1)
+                await asyncio.sleep(2)
+        return False
+
+    async def _mark_status(self, client_id: str, status: str, *,
+                            notes: Optional[str] = None) -> bool:
+        """UPDATE de status simple (failed_unprotected/orphaned/...)."""
+        try:
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute("""
+                    UPDATE trades
+                       SET status=$2, notes=COALESCE($3, notes)
+                     WHERE client_order_id=$1
+                """, client_id, status, notes)
+            return True
+        except Exception:
+            logger.exception("mark_status %s falló coid=%s", status, client_id)
+            return False
+
+    async def _handle_unprotected_single(self, state: "AssetState", side: str,
+                                          broker, client_id: str,
+                                          size_base: float,
+                                          entry_px: Optional[float],
+                                          err: Optional[str]) -> None:
+        """
+        C-3: entry OK pero SL/TP falló y el pánico del adapter también. La
+        posición puede estar ABIERTA sin protección. Marcamos el estado,
+        alertamos en CRÍTICO e intentamos un cierre de emergencia (3 intentos,
+        backoff 2s). Si todo falla → 'orphaned' + símbolo bloqueado.
+        """
+        await self._mark_status(
+            client_id, "failed_unprotected",
+            notes=("SL/TP placement failed: " + (err or ""))[:500])
         await self.tg.send(
-            f"📈 *ENTRADA* `{state.asset_string}` `{side.upper()}`\n"
-            f"Size: `${decision.size_quote:,.2f}` ({size_base:.6f})\n"
-            f"Entry: `{current_price:.4f}` SL: `{decision.stop_loss_price:.4f}` "
-            f"TP: `{decision.take_profit_price:.4f}`\n"
-            + self.tg.code_block(decision.reason[:200])
-        )
+            f"🚨🚨 CRÍTICO {state.asset_string} {side}: posición ABIERTA sin "
+            f"protección (coid={client_id}). Cierre de emergencia en curso.",
+            parse_mode=None)
+
+        opposite = "sell" if side == "long" else "buy"
+        backoff = 2.0
+        for attempt in range(3):
+            res = await broker.submit_market_order(
+                state.asset_string, opposite, size_base,
+                broker.make_client_order_id(state.asset_string, opposite))
+            if res.success:
+                exit_px = res.avg_price
+                pnl_quote = None
+                if exit_px is not None and entry_px is not None:
+                    direction = 1.0 if side == "long" else -1.0
+                    pnl_quote = direction * (exit_px - entry_px) * size_base
+                await self._finalize_trade_closed(
+                    client_id, entry_px, exit_px, pnl_quote,
+                    exit_reason="emergency_close",
+                    notes="closed after SL/TP placement failure")
+                await self.tg.send(
+                    f"✅ Cierre de emergencia OK {state.asset_string} "
+                    f"coid={client_id} exit={exit_px}", parse_mode=None)
+                return
+            logger.error("[%s] cierre de emergencia intento %d/3 falló: %s",
+                         state.asset_string, attempt + 1, res.error)
+            await asyncio.sleep(backoff)
+            backoff *= 2
+
+        # Todos los intentos fallaron: posición huérfana, bloquear símbolo.
+        await self._mark_status(
+            client_id, "orphaned",
+            notes="emergency close failed; manual intervention required")
+        state.open_position = {"client_id": client_id, "status": "orphaned",
+                               "side": side, "size_base": size_base,
+                               "opened_at": time.time()}
+        await self.tg.send(
+            f"🆘 ORPHANED {state.asset_string} {side} size={size_base} "
+            f"coid={client_id}: posición abierta NO cerrable. Requiere "
+            f"intervención manual.", parse_mode=None)
+
+    async def _unresolved_alert_loop(self) -> None:
+        """
+        Cada `unresolved_alert_secs` reporta a Telegram los trades en estados
+        problemáticos (huérfanos / fallos de protección / pares partidos) que
+        requieren intervención manual, hasta que se resuelvan.
+        """
+        problem = ("failed_unprotected", "orphaned",
+                   "pair_leg_a_orphaned", "pair_leg_b_close_failed")
+        while not self._stop.is_set():
+            try:
+                await asyncio.sleep(self.cfg.unresolved_alert_secs)
+                if self.pg_pool is None:
+                    continue
+                rows = await self.pg_pool.fetch("""
+                    SELECT client_order_id, symbol, side, status, size_base
+                      FROM trades
+                     WHERE status = ANY($1::text[])
+                """, list(problem))
+                if not rows:
+                    continue
+                lines = [
+                    f"{r['status']} {r['symbol']} {r['side']} "
+                    f"size={r['size_base']} coid={r['client_order_id']}"
+                    for r in rows
+                ]
+                await self.tg.send(
+                    "🆘 Trades sin resolver (intervención manual):\n"
+                    + self.tg.code_block("\n".join(lines)))
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("unresolved_alert_loop")
 
     # ---- Reconciliación de órdenes (cierre natural por SL/TP) ----
 
