@@ -125,6 +125,7 @@ class BotConfig:
     garch_refit_secs: int = 3600
     decision_period_secs: float = 2.0
     pair_decision_period_secs: float = 30.0
+    reconciliation_period_secs: float = 12.0   # cierre SL/TP: poll cada 10-15s
 
     # Quote currencies por asset class
     crypto_quote: str = "USDT"
@@ -241,16 +242,68 @@ class TelegramNotifier:
         self._client = httpx.AsyncClient(timeout=10.0)
         self._enabled = bool(token and chat_id)
 
+    # Caracteres reservados de MarkdownV2 (Telegram Bot API). Cualquier
+    # variable dinámica interpolada en un mensaje MarkdownV2 debe escaparlos
+    # o Telegram responde HTTP 400 "can't parse entities".
+    _MDV2_SPECIALS = r"_*[]()~`>#+-=|{}.!"
+
+    @classmethod
+    def escape_mdv2(cls, text) -> str:
+        """Escapa todos los reservados de MarkdownV2 en una variable dinámica."""
+        s = str(text)
+        for ch in cls._MDV2_SPECIALS:
+            s = s.replace(ch, "\\" + ch)
+        return s
+
+    @staticmethod
+    def code_block(text) -> str:
+        """
+        Envuelve texto técnico (errores de broker, IDs de orden, dumps de ccxt
+        con llaves/guiones/comillas, dict de fills) en un bloque ```text ... ```
+        para que Telegram lo trate como texto plano y NO parsee entidades
+        Markdown/MarkdownV2 — la causa típica del HTTP 400 'can't parse
+        entities'. Neutraliza los backticks que cerrarían el bloque antes.
+        """
+        safe = str(text).replace("```", "ʼʼʼ").replace("`", "ʼ")
+        return f"```text\n{safe}\n```"
+
     async def send(self, text, parse_mode="Markdown"):
         if not self._enabled:
             return
+        # Blindaje: la mensajería NUNCA debe poder detener el loop de trading.
+        # Capturamos CUALQUIER excepción (red, timeout, JSON, etc.) y además
+        # inspeccionamos el status: un 400/403/5xx no lanza en httpx, así que
+        # hay que mirarlo explícitamente.
+        # parse_mode=None debe viajar como AUSENCIA del campo, no como
+        # "parse_mode": null en el JSON: Telegram rechaza un parse_mode no
+        # reconocido con 400 'unsupported parse_mode'. Omitir la clave fuerza
+        # texto plano puro (mismo criterio que el reintento de abajo).
+        payload = {"chat_id": self.chat_id, "text": text}
+        if parse_mode is not None:
+            payload["parse_mode"] = parse_mode
         try:
-            await self._client.post(
+            resp = await self._client.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": self.chat_id, "text": text, "parse_mode": parse_mode},
+                json=payload,
             )
-        except httpx.RequestError as e:
-            logger.warning("Telegram falló: %s", e)
+            if resp.status_code >= 400:
+                logger.error(
+                    "Fallo no bloqueante en notificación de Telegram: HTTP %s %s",
+                    resp.status_code, resp.text[:300])
+                # Si fue un 400 de parseo (formato Markdown roto), reintentamos
+                # una vez en texto plano para no perder el alert.
+                if parse_mode is not None and resp.status_code == 400:
+                    try:
+                        await self._client.post(
+                            f"https://api.telegram.org/bot{self.token}/sendMessage",
+                            json={"chat_id": self.chat_id, "text": text},
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Fallo no bloqueante en notificación de Telegram: %s", e)
+        except Exception as e:
+            logger.error("Fallo no bloqueante en notificación de Telegram: %s", e)
+            return
 
     async def close(self):
         await self._client.aclose()
@@ -362,7 +415,15 @@ class TradingBot:
             await conn.execute(SCHEMA_SQL)
 
         # Risk / LLM / Telegram
-        self.risk = RiskManager(self.redis, RiskConfig())
+        # paper_trading selecciona el perfil de costos TCA crypto: en paper se
+        # relaja a ~3 bps (baja fricción de testnet); en live usa los costos
+        # reales de Binance spot (~18 bps). Ver CryptoTradingCosts.for_paper_trading.
+        self.risk = RiskManager(self.redis, RiskConfig(),
+                                paper_trading=self.cfg.paper_trading)
+        logger.info("RiskManager TCA crypto profile: %s (umbral maker=%.1f bps)",
+                     "paper_sim" if self.cfg.paper_trading else "production",
+                     self.risk.crypto_costs.round_trip_bps(False)
+                     * self.risk.cfg.crypto.tca_safety_margin)
         if self.cfg.enable_llm_validation:
             self.llm = LLMManager(self.cfg.gemini_api_key,
                                     self.cfg.deepseek_api_key)
@@ -409,6 +470,8 @@ class TradingBot:
                 tg.create_task(self._equity_snapshot_loop(), name="equity_snap")
                 tg.create_task(self._daily_report_loop(), name="daily_report")
                 tg.create_task(self._session_monitor_loop(), name="session_mon")
+                tg.create_task(self._order_reconciliation_loop(),
+                                 name="order_reconcile")
         except* Exception as eg:
             # ExceptionGroup en Python 3.11+
             for e in eg.exceptions:
@@ -605,7 +668,13 @@ class TradingBot:
                               state.garch_params.beta,
                               state.garch_params.persistence)
             except Exception as e:
-                logger.warning("GARCH fit %s falló: %s", state.asset_string, e)
+                # state.garch_params se reasigna SOLO dentro del try, así que
+                # ante un fallo de convergencia los últimos parámetros válidos
+                # quedan intactos en memoria. Demoted a DEBUG para no inundar
+                # la consola con cada refit en ventanas con poca variabilidad
+                # (típico de Testnet de Binance en ticks rápidos).
+                logger.debug("GARCH fit %s falló (asimila últimos params "
+                              "válidos): %s", state.asset_string, e)
 
     # ---- Decision loop single-asset ----
 
@@ -638,6 +707,16 @@ class TradingBot:
             return
 
         side = "long" if z < 0 else "short"
+
+        # Binance Spot Testnet (paper) no permite cortos: no hay margen, así que
+        # un SHORT cripto falla con InsufficientFunds. Lo bloqueamos aquí, antes
+        # de gastar ciclos en la evaluación de riesgo y el envío al adaptador.
+        if (self.cfg.paper_trading
+                and state.asset_class == AssetClass.CRYPTO
+                and side == "short"):
+            logger.info("[CRYPTO] Señal SHORT descartada preventivamente en modo "
+                        "Paper Trading para evitar InsufficientFunds.")
+            return
 
         sigma2_forecast = garch_forecast_variance(
             garch, state.last_eps, state.last_sigma2, horizon=1)[0]
@@ -709,7 +788,24 @@ class TradingBot:
                                        decision, current_price: float):
         broker = self.brokers[state.asset_class]
         client_id = broker.make_client_order_id(state.asset_string, side)
-        size_base = decision.size_quote / current_price
+        # Coerción explícita a float Python puro (no np.float64): Alpaca's
+        # Pydantic models tipan qty como Real y aceptan numpy, pero la
+        # serialización JSON de algunos numpy scalars produce 'NaN' literal
+        # cuando la conversión falla silenciosamente. Guard finitude antes
+        # de mandar al broker — los adaptadores tienen su propio guard pero
+        # cortar acá evita gastar un client_order_id en una orden inválida.
+        try:
+            size_base = float(decision.size_quote) / float(current_price)
+        except (TypeError, ValueError, ZeroDivisionError) as e:
+            logger.error("[%s] size_base no computable (%s); orden descartada.",
+                         state.asset_string, e)
+            return
+        if not math.isfinite(size_base) or size_base <= 0:
+            logger.error(
+                "[%s] size_base no finito o ≤0 (size_quote=%s price=%s); "
+                "orden descartada.",
+                state.asset_string, decision.size_quote, current_price)
+            return
         broker_side = "buy" if side == "long" else "sell"
 
         result = await broker.submit_bracket_orders(
@@ -719,11 +815,50 @@ class TradingBot:
             stop_loss=decision.stop_loss_price,
             take_profit=decision.take_profit_price,
             client_order_id=client_id,
+            # Precio de referencia para que Alpaca clampe el TP a la
+            # microestructura (base_price + buffer). Binance lo ignora.
+            base_price=current_price,
         )
 
         if not result.success:
+            # Alerta de fallback/panic de Binance: el error de ccxt trae llaves,
+            # guiones y puntos. La enviamos como TEXTO PLANO (parse_mode=None)
+            # para que Telegram NO parsee entidades y nunca devuelva 400. En
+            # texto plano el error es seguro tal cual y no necesita code_block.
             await self.tg.send(
-                f"🚨 Ejecución falló {state.asset_string}: `{result.error}`")
+                f"🚨 Ejecución falló {state.asset_string}:\n{result.error}",
+                parse_mode=None)
+            # Si el SL/TP falló y la posición se cerró por pánico en el exchange,
+            # el round-trip SÍ ocurrió (entrada + cierre con fees reales). Lo
+            # registramos como 'closed' para que la DB refleje el estado real y
+            # el Unrealized PnL no lo cuente como abierto. Si el cierre de pánico
+            # también falló (panic_closed=False), la posición sigue abierta en el
+            # exchange y NO escribimos un cierre falso: solo queda el alerta TG.
+            if result.panic_closed:
+                entry_px = result.avg_price or current_price
+                exit_px = result.exit_price
+                pnl_quote = None
+                if exit_px is not None:
+                    direction = 1.0 if side == "long" else -1.0
+                    pnl_quote = direction * (exit_px - entry_px) * size_base
+                async with self.pg_pool.acquire() as conn:
+                    await conn.execute("""
+                        INSERT INTO trades
+                        (client_order_id, symbol, asset_class, side, entry_price,
+                         exit_price, size_quote, size_base, pnl_quote, status,
+                         closed_at, reasoning, risk_metrics)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'closed',NOW(),$10,$11)
+                        ON CONFLICT (client_order_id) DO UPDATE
+                          SET status='closed',
+                              exit_price=EXCLUDED.exit_price,
+                              pnl_quote=EXCLUDED.pnl_quote,
+                              closed_at=NOW()
+                    """, client_id, state.asset_string, state.asset_class.value,
+                        side, entry_px, exit_px, decision.size_quote, size_base,
+                        pnl_quote,
+                        json.dumps({"reason": decision.reason,
+                                    "panic_close": result.error}),
+                        json.dumps(decision.metrics))
             return
 
         state.open_position = {
@@ -750,12 +885,106 @@ class TradingBot:
                 json.dumps({"reason": decision.reason}),
                 json.dumps(decision.metrics))
 
+        # El símbolo va en un inline code span (`...`): su contenido es literal
+        # tanto en Markdown legacy como en MarkdownV2, así un ticker futuro con
+        # '_', '*' o '.' nunca rompe el parser ni dispara el HTTP 400. NO usamos
+        # escape_mdv2() aquí porque este send viaja en parse_mode="Markdown"
+        # legacy, que no honra los backslashes de escape (se verían crudos).
         await self.tg.send(
-            f"📈 *ENTRADA {state.asset_string}* `{side.upper()}`\n"
+            f"📈 *ENTRADA* `{state.asset_string}` `{side.upper()}`\n"
             f"Size: `${decision.size_quote:,.2f}` ({size_base:.6f})\n"
             f"Entry: `{current_price:.4f}` SL: `{decision.stop_loss_price:.4f}` "
-            f"TP: `{decision.take_profit_price:.4f}`\n_{decision.reason[:200]}_"
+            f"TP: `{decision.take_profit_price:.4f}`\n"
+            + self.tg.code_block(decision.reason[:200])
         )
+
+    # ---- Reconciliación de órdenes (cierre natural por SL/TP) ----
+
+    async def _order_reconciliation_loop(self):
+        """
+        Task de background NO bloqueante. Cada `reconciliation_period_secs`
+        busca trades 'open' en Postgres y, por cada uno, comprueba si sus
+        órdenes de protección (SL/TP) siguen vivas en el exchange.
+
+        Semántica OCO: cuando una pierna (SL o TP) se ejecuta, la otra se
+        cancela atómicamente; si NO queda ninguna orden abierta para el
+        símbolo, el round-trip se cerró de forma natural. Entonces capturamos
+        el exit fill, calculamos el PnL y marcamos el trade 'closed'.
+
+        Toda la I/O de red se aísla por-trade en try/except: un fallo nunca
+        congela este loop ni los WS principales (corren en tasks separadas).
+        """
+        while not self._stop.is_set():
+            try:
+                await asyncio.sleep(self.cfg.reconciliation_period_secs)
+                if self.pg_pool is None:
+                    continue
+                rows = await self.pg_pool.fetch("""
+                    SELECT client_order_id, symbol, asset_class, side,
+                           entry_price, size_base,
+                           EXTRACT(EPOCH FROM opened_at) AS opened_epoch
+                      FROM trades
+                     WHERE status = 'open'
+                """)
+                for row in rows:
+                    await self._reconcile_one_trade(row)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Error en _order_reconciliation_loop")
+
+    async def _reconcile_one_trade(self, row) -> None:
+        """Reconcilia un único trade 'open' contra el exchange (I/O aislada)."""
+        symbol = row["symbol"]
+        coid = row["client_order_id"]
+        try:
+            broker = next((b for ac, b in self.brokers.items()
+                           if ac.value == row["asset_class"]), None)
+            if broker is None:
+                return
+
+            open_orders = await broker.fetch_open_orders(symbol)
+            if open_orders is None:
+                return                      # estado desconocido → no cerrar
+            if len(open_orders) > 0:
+                return                      # protección aún viva → sigue abierto
+
+            # Sin protección viva: SL o TP se ejecutó. Reconstruimos el exit.
+            opened_epoch = row["opened_epoch"]
+            since_ms = int(float(opened_epoch) * 1000) if opened_epoch else None
+            exit_px = await broker.fetch_recent_fill_price(symbol, since_ms)
+
+            entry_px = (float(row["entry_price"])
+                        if row["entry_price"] is not None else None)
+            size_base = (float(row["size_base"])
+                         if row["size_base"] is not None else None)
+            pnl_quote = None
+            if None not in (exit_px, entry_px, size_base):
+                direction = 1.0 if row["side"] == "long" else -1.0
+                pnl_quote = direction * (exit_px - entry_px) * size_base
+
+            async with self.pg_pool.acquire() as conn:
+                await conn.execute("""
+                    UPDATE trades
+                       SET status='closed', exit_price=$2, pnl_quote=$3,
+                           closed_at=NOW()
+                     WHERE client_order_id=$1 AND status='open'
+                """, coid, exit_px, pnl_quote)
+
+            # Liberar el slot en memoria si correspondía a este trade.
+            st = self.states.get(symbol)
+            if (st is not None and st.open_position is not None
+                    and st.open_position.get("client_id") == coid):
+                st.open_position = None
+
+            logger.info("[RECONCILE] %s cerrado por SL/TP: exit=%s pnl_quote=%s "
+                        "(coid=%s)", symbol, exit_px, pnl_quote, coid)
+            await self.tg.send(
+                f"✅ Cierre conciliado `{symbol}`\n"
+                + self.tg.code_block(
+                    f"exit={exit_px} pnl_quote={pnl_quote} coid={coid}"))
+        except Exception:
+            logger.exception("Error reconciliando trade coid=%s (%s)", coid, symbol)
 
     # ---- Pair dispatcher ----
 
@@ -817,7 +1046,19 @@ class TradingBot:
                         spread_returns = np.diff(np.array(pair.spread_buffer,
                                                             dtype=np.float64))
                         if spread_returns.size >= 200:
-                            pair.spread_garch = fit_garch(spread_returns)
+                            # try/except local SOLO para el GARCH del spread:
+                            # ante no-convergencia (frecuente con ticks rápidos
+                            # de Testnet) preservamos el último spread_garch
+                            # válido y bajamos el log a DEBUG. El except externo
+                            # del refit sigue cubriendo errores reales de
+                            # cointegración/OU como WARNING.
+                            try:
+                                pair.spread_garch = fit_garch(spread_returns)
+                            except Exception as ge:
+                                logger.debug(
+                                    "[PAIR %s/%s] spread GARCH fit falló "
+                                    "(asimila últimos params válidos): %s",
+                                    pair.sym_a, pair.sym_b, ge)
 
                 logger.info("[PAIR %s/%s] refit: β=%.4f verdict=%s",
                               pair.sym_a, pair.sym_b,
@@ -906,8 +1147,21 @@ class TradingBot:
         side_a_broker = "buy" if is_long_spread else "sell"
         side_b_broker = "sell" if is_long_spread else "buy"
 
-        size_a_base = decision.leg_a_size_quote / state_a.kalman.x
-        size_b_base = decision.leg_b_size_quote / state_b.kalman.x
+        # Mismo guard que en la entrada single-asset: cortar antes de gastar
+        # client_order_ids si un leg arroja un size_base degenerado.
+        try:
+            size_a_base = float(decision.leg_a_size_quote) / float(state_a.kalman.x)
+            size_b_base = float(decision.leg_b_size_quote) / float(state_b.kalman.x)
+        except (TypeError, ValueError, ZeroDivisionError) as e:
+            logger.error("[PAIR %s/%s] size_base no computable (%s); descartado.",
+                         pair.sym_a, pair.sym_b, e)
+            return
+        if not (math.isfinite(size_a_base) and size_a_base > 0
+                and math.isfinite(size_b_base) and size_b_base > 0):
+            logger.error(
+                "[PAIR %s/%s] size_base no finito o ≤0 (a=%s b=%s); descartado.",
+                pair.sym_a, pair.sym_b, size_a_base, size_b_base)
+            return
 
         broker_a = self.brokers[state_a.asset_class]
         broker_b = self.brokers[state_b.asset_class]
@@ -918,14 +1172,16 @@ class TradingBot:
         result_a = await broker_a.submit_market_order(
             pair.sym_a, side_a_broker, size_a_base, cid_a)
         if not result_a.success:
-            await self.tg.send(f"🚨 Pair leg A falló: `{result_a.error}`")
+            await self.tg.send(f"🚨 Pair leg A falló:\n{result_a.error}",
+                               parse_mode=None)
             return
 
         result_b = await broker_b.submit_market_order(
             pair.sym_b, side_b_broker, size_b_base, cid_b)
         if not result_b.success:
             # Rollback leg A
-            await self.tg.send(f"🚨 Pair leg B falló, rollback A: `{result_b.error}`")
+            await self.tg.send(f"🚨 Pair leg B falló, rollback A:\n{result_b.error}",
+                               parse_mode=None)
             opp = "sell" if side_a_broker == "buy" else "buy"
             await broker_a.submit_market_order(pair.sym_a, opp, size_a_base,
                                                   broker_a.make_client_order_id(pair.sym_a, opp))
@@ -967,12 +1223,14 @@ class TradingBot:
                     json.dumps({"reason": decision.reason}),
                     json.dumps(decision.metrics))
 
+        # Ambos símbolos del par en un inline code span por el mismo motivo que
+        # en la entrada simple: contenido literal, inmune a '_'/'*'/'.' sin escape.
         await self.tg.send(
-            f"📊 *PAIR ENTRY {pair.sym_a}/{pair.sym_b}*\n"
+            f"📊 *PAIR ENTRY* `{pair.sym_a}/{pair.sym_b}`\n"
             f"Side: `{decision.metrics.get('pair_side')}`\n"
             f"Leg A: `${decision.leg_a_size_quote:,.2f}` @ {state_a.kalman.x:.4f}\n"
             f"Leg B: `${decision.leg_b_size_quote:,.2f}` @ {state_b.kalman.x:.4f}\n"
-            f"_{decision.reason[:200]}_"
+            + self.tg.code_block(decision.reason[:200])
         )
 
     # ---- Equity, snapshots, session monitor, daily ----

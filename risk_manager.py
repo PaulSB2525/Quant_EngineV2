@@ -116,7 +116,18 @@ class RiskDecision:
 
 @dataclass
 class CryptoTradingCosts:
-    """Costos en bps (1 bp = 0.01%). Defaults para Binance spot."""
+    """
+    Costos en bps (1 bp = 0.01%). Defaults = PRODUCCIÓN (Binance spot real).
+
+    El perfil activo lo decide el RiskManager según el flag paper_trading
+    (PAPER_TRADING en .env), vía CryptoTradingCosts.for_paper_trading():
+        - live  (PAPER_TRADING=false): production() -> umbral TCA maker = 18 bps
+        - paper (PAPER_TRADING=true):  paper_sim()  -> umbral TCA maker =  3 bps
+
+    Atar el perfil al flag de paper_trading garantiza que pasar a real
+    restaura automáticamente los costos conservadores: no hay valores de sim
+    que recordar revertir antes de comprometer capital.
+    """
     maker_fee_bps: float = 1.0
     taker_fee_bps: float = 5.0
     expected_spread_bps: float = 2.0
@@ -125,6 +136,26 @@ class CryptoTradingCosts:
     def round_trip_bps(self, use_taker: bool = False) -> float:
         fee = self.taker_fee_bps if use_taker else self.maker_fee_bps
         return 2.0 * (fee + self.expected_spread_bps + self.slippage_bps)
+
+    @classmethod
+    def production(cls) -> "CryptoTradingCosts":
+        """Costos reales de Binance spot. round_trip(maker)=12 bps -> umbral=18 bps."""
+        return cls()
+
+    @classmethod
+    def paper_sim(cls) -> "CryptoTradingCosts":
+        """
+        Perfil paper/simulación: spread y slippage a 0 (el testnet llena sin
+        fricción real). round_trip(maker)=2 bps -> umbral TCA = 3 bps, lo que
+        admite alphas de 10-12 bps sin desactivar la matemática de costos.
+        Fees maker/taker se conservan: incluso en sim representan un coste real.
+        """
+        return cls(expected_spread_bps=0.0, slippage_bps=0.0)
+
+    @classmethod
+    def for_paper_trading(cls, paper_trading: bool) -> "CryptoTradingCosts":
+        """Selecciona el perfil de costos según el modo paper/live."""
+        return cls.paper_sim() if paper_trading else cls.production()
 
 
 @dataclass
@@ -272,9 +303,16 @@ class RiskManager:
         - record_price_observation(...): alimenta la matriz de correlación.
     """
 
-    def __init__(self, redis: aioredis.Redis, config: Optional[RiskConfig] = None):
+    def __init__(self, redis: aioredis.Redis, config: Optional[RiskConfig] = None,
+                 paper_trading: bool = False):
         self.redis = redis
         self.cfg = config or RiskConfig()
+        # Perfil de costos crypto atado al modo paper/live. En paper se usa
+        # el perfil de baja fricción (umbral TCA ~3 bps); en live, los costos
+        # reales de Binance spot (umbral ~18 bps). Override puntual posible
+        # pasando crypto_costs explícito a evaluate()/evaluate_pair_trade().
+        self.paper_trading = paper_trading
+        self.crypto_costs = CryptoTradingCosts.for_paper_trading(paper_trading)
 
     # ---------- Helpers de día ----------
 
@@ -282,8 +320,20 @@ class RiskManager:
     def _today_utc() -> str:
         return time.strftime("%Y-%m-%d", time.gmtime())
 
-    async def get_or_set_day_start_equity(self, current_equity: float) -> float:
-        key = f"risk:daily_equity_start:{self._today_utc()}"
+    # Las claves de drawdown diario se SEGMENTAN POR asset_class. Razón: en
+    # paper/testnet cada broker arranca con balances de magnitudes distintas
+    # (p.ej. Binance Testnet $100k, Alpaca Paper $10k); consolidar la suma
+    # interpreta la asimetría como un drawdown catastrófico (~89%) y bloquea
+    # todas las entradas en el open. Aislando por clase, un desajuste en
+    # simulación de cripto NO apaga las brackets de equity y viceversa.
+    # Esquema de claves:
+    #   risk:daily_equity_start:{asset_class.value}:{YYYY-MM-DD}
+    #   risk:day_locked:{asset_class.value}:{YYYY-MM-DD}
+    # Las claves planas previas tenían TTL=30h y se evaporan solas.
+
+    async def get_or_set_day_start_equity(self, current_equity: float,
+                                            asset_class: AssetClass) -> float:
+        key = f"risk:daily_equity_start:{asset_class.value}:{self._today_utc()}"
         existing = await self.redis.get(key)
         if existing is not None:
             return float(existing)
@@ -291,38 +341,49 @@ class RiskManager:
         val = await self.redis.get(key)
         return float(val)
 
-    async def is_day_locked(self) -> bool:
-        return bool(await self.redis.get(f"risk:day_locked:{self._today_utc()}"))
+    async def is_day_locked(self, asset_class: AssetClass) -> bool:
+        return bool(await self.redis.get(
+            f"risk:day_locked:{asset_class.value}:{self._today_utc()}"))
 
-    async def lock_day(self, reason: str):
+    async def lock_day(self, reason: str, asset_class: AssetClass):
         await self.redis.set(
-            f"risk:day_locked:{self._today_utc()}",
-            json.dumps({"locked_at": time.time(), "reason": reason}),
+            f"risk:day_locked:{asset_class.value}:{self._today_utc()}",
+            json.dumps({"locked_at": time.time(), "reason": reason,
+                        "asset_class": asset_class.value}),
             ex=60 * 60 * 30,
         )
 
-    async def check_daily_drawdown(self, current_equity: float) -> Optional[RiskDecision]:
-        if await self.is_day_locked():
+    async def check_daily_drawdown(self, current_equity: float,
+                                      asset_class: AssetClass
+                                      ) -> Optional[RiskDecision]:
+        if await self.is_day_locked(asset_class):
             return RiskDecision(
                 verdict=RiskVerdict.REJECT_DRAWDOWN,
                 size_quote=0.0, stop_loss_price=0.0, take_profit_price=0.0,
-                reason="Día bloqueado: drawdown del 2% ya activado.",
+                reason=f"Día bloqueado ({asset_class.value}): drawdown del "
+                       f"{self.cfg.daily_drawdown_limit_pct*100:.2f}% ya activado.",
             )
-        start = await self.get_or_set_day_start_equity(current_equity)
+        start = await self.get_or_set_day_start_equity(current_equity, asset_class)
         if start <= 0:
             return None
         dd = (start - current_equity) / start
         if dd >= self.cfg.daily_drawdown_limit_pct:
             await self.lock_day(
-                f"DD diario {dd*100:.2f}% ≥ {self.cfg.daily_drawdown_limit_pct*100:.2f}%"
+                f"DD diario {dd*100:.2f}% ≥ "
+                f"{self.cfg.daily_drawdown_limit_pct*100:.2f}% "
+                f"(asset_class={asset_class.value})",
+                asset_class,
             )
             return RiskDecision(
                 verdict=RiskVerdict.REJECT_DRAWDOWN,
                 size_quote=0.0, stop_loss_price=0.0, take_profit_price=0.0,
-                reason=f"Drawdown diario {dd*100:.2f}% supera límite "
-                       f"{self.cfg.daily_drawdown_limit_pct*100:.2f}%. Día bloqueado.",
+                reason=f"Drawdown diario {asset_class.value} {dd*100:.2f}% "
+                       f"supera límite "
+                       f"{self.cfg.daily_drawdown_limit_pct*100:.2f}%. "
+                       f"Día bloqueado para {asset_class.value}.",
                 metrics={"daily_drawdown": dd, "start_equity": start,
-                         "current_equity": current_equity},
+                         "current_equity": current_equity,
+                         "asset_class": asset_class.value},
             )
         return None
 
@@ -566,8 +627,38 @@ class RiskManager:
                 reason=f"Mercado cerrado para {symbol}. Esperando reapertura.",
             )
 
-        # ---- 1. Drawdown ----
-        dd_check = await self.check_daily_drawdown(current_equity)
+        # ---- 0bis. Sanidad numérica de inputs críticos ----
+        # current_price degenerado (NaN, Inf, 0) propaga a SL/TP y rompe la
+        # validación del broker con un 422 críptico. Cortamos limpio antes
+        # de cualquier evaluación. equity NaN se atrapa por separado: el
+        # bot_core ya lo mapea a 0 vía _fetch_equity, pero validamos también.
+        try:
+            cp_f = float(current_price)
+            eq_f = float(current_equity)
+        except (TypeError, ValueError) as e:
+            return RiskDecision(
+                verdict=RiskVerdict.REJECT_KELLY_NEGATIVE,
+                size_quote=0.0, stop_loss_price=0.0, take_profit_price=0.0,
+                reason=f"Input numérico inválido: {e}",
+            )
+        if not (math.isfinite(cp_f) and cp_f > 0):
+            return RiskDecision(
+                verdict=RiskVerdict.REJECT_KELLY_NEGATIVE,
+                size_quote=0.0, stop_loss_price=0.0, take_profit_price=0.0,
+                reason=f"current_price no finito o ≤0: {current_price}",
+            )
+        if not math.isfinite(eq_f) or eq_f <= 0:
+            return RiskDecision(
+                verdict=RiskVerdict.REJECT_KELLY_NEGATIVE,
+                size_quote=0.0, stop_loss_price=0.0, take_profit_price=0.0,
+                reason=f"current_equity no finito o ≤0: {current_equity}",
+            )
+
+        # ---- 1. Drawdown (aislado por asset_class) ----
+        # El symbol viene prefijado ("CRYPTO:..." / "EQUITY:..."), así que el
+        # asset_class se deriva localmente sin tocar la firma pública.
+        _ac_self, _ = parse_asset_class(symbol)
+        dd_check = await self.check_daily_drawdown(current_equity, _ac_self)
         if dd_check is not None:
             return dd_check
 
@@ -600,7 +691,7 @@ class RiskManager:
 
         # ---- 5. TCA (diferenciado) ----
         if asset_class == AssetClass.CRYPTO:
-            costs_c = crypto_costs or CryptoTradingCosts()
+            costs_c = crypto_costs or self.crypto_costs
             passes_tca, alpha_bps, thresh_bps = self.tca_check_crypto(
                 expected_alpha_bps, costs_c, use_taker=use_taker)
         else:
@@ -688,27 +779,47 @@ class RiskManager:
         # Sanitización defensiva antes de devolver al broker adapter:
         #   1. Floor positivo: equities y crypto cotizan > 0; un TP negativo
         #      en un short con ATR enorme reventaría la validación de Alpaca.
-        #   2. Redondeo a 2 decimales (tick size estándar equity > $1).
+        #   2. Equity → redondeo a 2 decimales (tickSize estándar > $1).
+        #      Crypto → SIN rounding fijo aquí: el BinanceBrokerAdapter
+        #      cuantiza al tickSize REAL del par vía price_to_precision en el
+        #      momento del envío. Hard-codear 2 dp aquí era correcto para
+        #      BTC/ETH/USDT pero rompía pares de bajo nominal (DOGE 0.1,
+        #      SHIB 0.00001) donde el tickSize válido es < 0.01 y "round(.., 2)"
+        #      colapsaba a 0 o a un múltiplo no permitido por PRICE_FILTER.
         #   3. Invariante de orientación: long ⇒ TP > entry > SL; short ⇒
         #      SL > entry > TP. Si la sanitización rompió la invariante,
-        #      revertir al snap mínimo (1 tick de separación).
-        MIN_PRICE = 0.01
-        MIN_GAP = 0.01
-        sl = round(max(sl, MIN_PRICE), 2)
-        tp = round(max(tp, MIN_PRICE), 2)
+        #      revertir al snap mínimo de 1 tick equivalente.
+        if asset_class == AssetClass.EQUITY:
+            MIN_PRICE = 0.01
+            MIN_GAP = 0.01
+            sl = round(max(sl, MIN_PRICE), 2)
+            tp = round(max(tp, MIN_PRICE), 2)
+        else:
+            # Crypto: piso positivo simbólico (1e-12 USDT) y gap proporcional
+            # al precio actual (1 bps), suficiente para forzar separación
+            # ordinal sin imponer un tick que el adapter terminará re-cuantizando.
+            MIN_PRICE = 1e-12
+            MIN_GAP = max(cp_f * 1e-4, 1e-8)
+            sl = max(float(sl), MIN_PRICE)
+            tp = max(float(tp), MIN_PRICE)
 
         if side == "long" and tp <= sl:
-            tp = round(sl + MIN_GAP, 2)
+            tp = sl + MIN_GAP
+            if asset_class == AssetClass.EQUITY:
+                tp = round(tp, 2)
         elif side == "short" and tp >= sl:
             # En short, TP debe ser estrictamente menor que SL. Si la
             # sanitización los aplastó al floor, separar artificialmente
             # SL hacia arriba para preservar la geometría.
-            sl = round(max(sl, tp + MIN_GAP), 2)
+            sl = max(sl, tp + MIN_GAP)
             # Y si el floor también empujó tp hacia arriba del precio,
             # asegurar tp < current_price para que no sea inejecutable.
-            if tp >= current_price:
-                tp = round(max(current_price - MIN_GAP, MIN_PRICE), 2)
-                sl = round(max(sl, tp + MIN_GAP), 2)
+            if tp >= cp_f:
+                tp = max(cp_f - MIN_GAP, MIN_PRICE)
+                sl = max(sl, tp + MIN_GAP)
+            if asset_class == AssetClass.EQUITY:
+                sl = round(sl, 2)
+                tp = round(tp, 2)
 
         return RiskDecision(
             verdict=RiskVerdict.APPROVED,
@@ -776,8 +887,18 @@ class RiskManager:
                 reason=f"Mercado(s) cerrado(s) para pair: {closed}",
             )
 
-        # ---- 1. Drawdown ----
-        dd_check = await self.check_daily_drawdown(current_equity)
+        # Namespace del leg más restrictivo: si CUALQUIER leg es equity, todo
+        # el par se evalúa bajo el régimen equity (más conservador). Se hoistea
+        # aquí porque el drawdown ahora también necesita el asset_class para
+        # aislar la clave de bloqueo (un pair cross-class respeta el día de
+        # equity; un pair puro crypto vive en su propio namespace).
+        ac_a, _ = parse_asset_class(symbol_a)
+        ac_b, _ = parse_asset_class(symbol_b)
+        restrictive_class = AssetClass.EQUITY if AssetClass.EQUITY in (ac_a, ac_b) \
+                            else AssetClass.CRYPTO
+
+        # ---- 1. Drawdown (aislado por asset_class del par) ----
+        dd_check = await self.check_daily_drawdown(current_equity, restrictive_class)
         if dd_check is not None:
             return dd_check
 
@@ -790,11 +911,6 @@ class RiskManager:
             )
 
         # ---- 3. Half-life sobre el spread ----
-        # Tomamos el namespace del leg más restrictivo (equity si involucrado)
-        ac_a, _ = parse_asset_class(symbol_a)
-        ac_b, _ = parse_asset_class(symbol_b)
-        restrictive_class = AssetClass.EQUITY if AssetClass.EQUITY in (ac_a, ac_b) \
-                            else AssetClass.CRYPTO
         hl_msg = self._check_half_life_coherent(spread_half_life_sec, restrictive_class)
         if hl_msg is not None:
             return RiskDecision(
@@ -870,13 +986,13 @@ class RiskManager:
         # Cada leg paga sus propios costos. Sumamos.
         total_cost_bps = 0.0
         if ac_a == AssetClass.CRYPTO:
-            cc = crypto_costs or CryptoTradingCosts()
+            cc = crypto_costs or self.crypto_costs
             total_cost_bps += cc.round_trip_bps(use_taker=False)
         else:
             ec = equity_costs or EquityTradingCosts()
             total_cost_bps += ec.round_trip_bps(leg_a, price_a, spread_vol_ann)
         if ac_b == AssetClass.CRYPTO:
-            cc = crypto_costs or CryptoTradingCosts()
+            cc = crypto_costs or self.crypto_costs
             total_cost_bps += cc.round_trip_bps(use_taker=False)
         else:
             ec = equity_costs or EquityTradingCosts()
